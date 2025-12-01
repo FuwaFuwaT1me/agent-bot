@@ -3,15 +3,28 @@
 from __future__ import annotations
 import os
 from typing import Dict, List
+from dotenv import load_dotenv
 from yandex_cloud_ml_sdk import YCloudML
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
+# Загружаем переменные окружения из .env файла
+load_dotenv()
+
 user_conversations: Dict[int, List[Dict[str, str]]] = {}
 
+# Читаем переменные окружения из .env файла
 YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID")
 YANDEX_AUTH = os.getenv("YANDEX_AUTH")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+# Проверяем наличие обязательных переменных
+if not YANDEX_FOLDER_ID:
+    raise ValueError("YANDEX_FOLDER_ID не установлен! Добавьте его в файл .env")
+if not YANDEX_AUTH:
+    raise ValueError("YANDEX_AUTH не установлен! Добавьте его в файл .env")
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN не установлен! Добавьте его в файл .env")
 
 sdk = YCloudML(
     folder_id=YANDEX_FOLDER_ID,
