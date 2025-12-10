@@ -43,6 +43,8 @@ MODELS = {
 
 # === 2. СИСТЕМНЫЙ ПРОМПТ ===
 SYSTEM_PROMPT = """
+отвечай на вопросы очень подробно
+ИСПОЛЬЗУЙ ВСЕ ДОСТУПНЫЕ ТОКЕНЫ ДЛЯ ОТВЕТА
 """
 
 # === 3. ИСТОРИЯ СООБЩЕНИЙ ДЛЯ КАЖДОГО ПОЛЬЗОВАТЕЛЯ ===
@@ -56,6 +58,12 @@ user_temperatures: Dict[int, float] = {}
 # === 5. ВЫБРАННАЯ МОДЕЛЬ ДЛЯ КАЖДОГО ПОЛЬЗОВАТЕЛЯ ===
 user_models: Dict[int, str] = {}  # "yandex" или "deepseek"
 
+# === 6. ЛИМИТ ТОКЕНОВ ДЛЯ КАЖДОГО ПОЛЬЗОВАТЕЛЯ ===
+user_max_tokens: Dict[int, int] = {}  # Максимум токенов в ответе (0 = без лимита)
+
+# === 7. ПРЕДЫДУЩЕЕ ЗНАЧЕНИЕ INPUT TOKENS (для расчёта токенов текущего запроса) ===
+user_prev_input_tokens: Dict[int, int] = {}
+
 def get_history(user_id: int) -> List[dict]:
     """Получает историю для пользователя. Создаёт новую, если её нет."""
     if user_id not in user_histories:
@@ -66,6 +74,7 @@ def get_history(user_id: int) -> List[dict]:
 def clear_history(user_id: int):
     """Очищает историю пользователя."""
     user_histories[user_id] = [{"role": "system", "text": SYSTEM_PROMPT}]
+    user_prev_input_tokens[user_id] = 0  # Сбрасываем счётчик токенов
 
 def change_system_prompt(user_id: int, prompt: str):
     """Изменяет системный промпт для пользователя."""
@@ -92,13 +101,24 @@ def set_model(user_id: int, model: str):
     user_models[user_id] = model
 
 
+def get_max_tokens(user_id: int) -> int:
+    """Получает лимит токенов для пользователя. 0 = без лимита."""
+    return user_max_tokens.get(user_id, 0)
+
+
+def set_max_tokens(user_id: int, max_tokens: int):
+    """Устанавливает лимит токенов для пользователя."""
+    user_max_tokens[user_id] = max_tokens
+
+
 @dataclass
 class AgentResponse:
     """Результат ответа агента с метриками."""
     text: str
-    input_tokens: int
-    output_tokens: int
-    total_tokens: int
+    input_tokens: int      # Токены всей истории (context)
+    output_tokens: int     # Токены ответа
+    total_tokens: int      # Всего токенов в этом запросе
+    message_tokens: int    # Токены только текущего сообщения пользователя
     time_seconds: float
     cost_rub: float  # Примерная стоимость в рублях
     model: str = ""  # Название модели
@@ -109,11 +129,15 @@ PRICE_INPUT_PER_1K = 0.12   # входные токены
 PRICE_OUTPUT_PER_1K = 0.24  # выходные токены
 
 
-def ask_yandex(history: List[dict], temperature: float) -> tuple:
-    """Запрос к YandexGPT."""
-    result = yandex_sdk.models.completions("yandexgpt").configure(
-        temperature=temperature
-    ).run(history)
+def ask_yandex(history: List[dict], temperature: float, max_tokens: int = 0) -> tuple:
+    """Запрос к YandexGPT. max_tokens ограничивает только ответ (completion), не контекст."""
+    model = yandex_sdk.models.completions("yandexgpt")
+    
+    # Настраиваем параметры генерации
+    if max_tokens > 0:
+        result = model.configure(temperature=temperature, max_tokens=max_tokens).run(history)
+    else:
+        result = model.configure(temperature=temperature).run(history)
     
     response_text = ""
     input_tokens = 0
@@ -122,22 +146,16 @@ def ask_yandex(history: List[dict], temperature: float) -> tuple:
     for alt in result:
         if hasattr(alt, 'text'):
             response_text = alt.text
-        if hasattr(alt, 'input_text_length'):
-            input_tokens = alt.input_text_length
-        if hasattr(alt, 'completion_tokens'):
-            output_tokens = alt.completion_tokens
     
     if hasattr(result, 'usage'):
         usage = result.usage
-        if hasattr(usage, 'input_text_length'):
-            input_tokens = usage.input_text_length
-        if hasattr(usage, 'completion_tokens'):
-            output_tokens = usage.completion_tokens
+        input_tokens = getattr(usage, 'input_text_tokens', 0)
+        output_tokens = getattr(usage, 'completion_tokens', 0)
     
     return response_text, input_tokens, output_tokens
 
 
-def ask_deepseek(history: List[dict], temperature: float) -> tuple:
+def ask_deepseek(history: List[dict], temperature: float, max_tokens: int = 0) -> tuple:
     """Запрос к DeepSeek через HuggingFace."""
     # Конвертируем формат истории (text -> content)
     messages = []
@@ -147,11 +165,15 @@ def ask_deepseek(history: List[dict], temperature: float) -> tuple:
             "content": msg.get("text", msg.get("content", ""))
         })
     
-    completion = hf_client.chat.completions.create(
-        model="deepseek-ai/DeepSeek-V3",
-        messages=messages,
-        temperature=temperature
-    )
+    kwargs = {
+        "model": "deepseek-ai/DeepSeek-V3",
+        "messages": messages,
+        "temperature": temperature
+    }
+    if max_tokens > 0:
+        kwargs["max_tokens"] = max_tokens
+    
+    completion = hf_client.chat.completions.create(**kwargs)
     
     response_text = completion.choices[0].message.content or ""
     input_tokens = completion.usage.prompt_tokens if completion.usage else 0
@@ -164,6 +186,11 @@ def ask_agent(user_id: int, question: str) -> AgentResponse:
     """Отправляет вопрос агенту и получает ответ с метриками."""
     history = get_history(user_id)
     model = get_model(user_id)
+    temperature = get_temperature(user_id)
+    max_tokens = get_max_tokens(user_id)
+    
+    # Получаем предыдущее значение input_tokens для расчёта токенов сообщения
+    prev_input_tokens = user_prev_input_tokens.get(user_id, 0)
     
     # Добавляем вопрос в историю
     history.append({"role": "user", "text": question})
@@ -173,12 +200,22 @@ def ask_agent(user_id: int, question: str) -> AgentResponse:
     
     # Запрос к выбранной модели
     if model == "deepseek":
-        response_text, input_tokens, output_tokens = ask_deepseek(history, get_temperature(user_id))
+        response_text, input_tokens, output_tokens = ask_deepseek(history, temperature, max_tokens)
     else:
-        response_text, input_tokens, output_tokens = ask_yandex(history, get_temperature(user_id))
+        response_text, input_tokens, output_tokens = ask_yandex(history, temperature, max_tokens)
     
     elapsed_time = time.time() - start_time
     total_tokens = input_tokens + output_tokens
+    
+    # Рассчитываем токены только текущего сообщения
+    # (разница между текущим context и предыдущим context + предыдущий ответ)
+    message_tokens = input_tokens - prev_input_tokens
+    if message_tokens < 0:
+        message_tokens = input_tokens  # Если история была очищена
+    
+    # Сохраняем текущее значение для следующего запроса
+    # (input_tokens + output_tokens = следующий prev_input_tokens)
+    user_prev_input_tokens[user_id] = input_tokens + output_tokens
     
     # Рассчитываем стоимость (примерно)
     cost = (input_tokens / 1000 * PRICE_INPUT_PER_1K) + (output_tokens / 1000 * PRICE_OUTPUT_PER_1K)
@@ -191,6 +228,7 @@ def ask_agent(user_id: int, question: str) -> AgentResponse:
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
+        message_tokens=message_tokens,
         time_seconds=elapsed_time,
         cost_rub=cost,
         model=MODELS[model]
@@ -211,7 +249,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/clear - очистить историю диалога\n"
         "/set_system_prompt <текст> - изменить системный промпт\n"
         "/temperature - показать текущую температуру\n"
-        "/set_temperature <0-1> - изменить температуру"
+        "/set_temperature <0-1> - изменить температуру\n"
+        "/max_tokens - показать лимит токенов\n"
+        "/set_max_tokens <число> - установить лимит токенов"
     )
 
 
@@ -275,6 +315,45 @@ async def cmd_set_temperature(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"🌡 Температура установлена: {new_temp}")
     except ValueError as e:
         await update.message.reply_text(f"❌ Ошибка: {e}\nУкажи число от 0 до 1")
+
+
+async def cmd_max_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /max_tokens - показывает текущий лимит токенов"""
+    user_id = update.effective_user.id
+    current_limit = get_max_tokens(user_id)
+    if current_limit == 0:
+        await update.message.reply_text("📏 Лимит токенов: без ограничений")
+    else:
+        await update.message.reply_text(f"📏 Лимит токенов: {current_limit}")
+
+
+async def cmd_set_max_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /set_max_tokens <число>"""
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        current_limit = get_max_tokens(user_id)
+        await update.message.reply_text(
+            f"📏 Текущий лимит: {current_limit if current_limit > 0 else 'без ограничений'}\n\n"
+            "Использование: /set_max_tokens <число>\n"
+            "• 0 - без ограничений\n"
+            "• 100-8000 - лимит токенов в ответе\n\n"
+            "Пример: /set_max_tokens 500"
+        )
+        return
+    
+    try:
+        new_limit = int(context.args[0])
+        if new_limit < 0:
+            raise ValueError("Лимит не может быть отрицательным")
+        
+        set_max_tokens(user_id, new_limit)
+        if new_limit == 0:
+            await update.message.reply_text("📏 Лимит токенов снят (без ограничений)")
+        else:
+            await update.message.reply_text(f"📏 Лимит токенов установлен: {new_limit}")
+    except ValueError as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}\nУкажи целое число >= 0")
 
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,10 +438,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Формируем сообщение с метриками
         stats = (
             f"\n\n---\n"
-            f"🤖 {response.model} | "
-            f"⏱ {response.time_seconds:.2f}s | "
-            f"📊 {response.total_tokens} tokens ({response.input_tokens}→{response.output_tokens}) | "
-            f"💰 {response.cost_rub:.4f}₽"
+            f"🤖 {response.model} | ⏱ {response.time_seconds:.2f}s | 💰 {response.cost_rub:.4f}₽\n"
+            f"💬 Your message: {response.message_tokens} tokens\n"
+            f"📥 Context (history): {response.input_tokens} tokens\n"
+            f"📤 Response: {response.output_tokens} tokens\n"
+            f"📊 This request total: {response.total_tokens} tokens"
         )
         
         await update.message.reply_text(response.text + stats)
@@ -382,6 +462,8 @@ def main():
     app.add_handler(CommandHandler("set_system_prompt", cmd_set_system_prompt))
     app.add_handler(CommandHandler("temperature", cmd_temperature))
     app.add_handler(CommandHandler("set_temperature", cmd_set_temperature))
+    app.add_handler(CommandHandler("max_tokens", cmd_max_tokens))
+    app.add_handler(CommandHandler("set_max_tokens", cmd_set_max_tokens))
     app.add_handler(CallbackQueryHandler(handle_model_callback, pattern="^model_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
