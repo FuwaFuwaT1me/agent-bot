@@ -13,6 +13,7 @@ from openai import OpenAI
 from yandex_cloud_ml_sdk import YCloudML
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from history_compressor import check_and_compress_history
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -64,10 +65,19 @@ user_max_tokens: Dict[int, int] = {}  # Максимум токенов в от�
 # === 7. ПРЕДЫДУЩЕЕ ЗНАЧЕНИЕ INPUT TOKENS (для расчёта токенов текущего запроса) ===
 user_prev_input_tokens: Dict[int, int] = {}
 
+# === 8. СЖАТИЕ ИСТОРИИ ===
+# Индекс последнего сообщения после последнего сжатия для каждого пользователя
+user_last_compressed_idx: Dict[int, int] = {}
+
+# Количество сообщений (user + assistant, каждое считается отдельно) до срабатывания триггера сжатия (0 = отключено)
+user_compress_trigger_turns: Dict[int, int] = {}
+
 def get_history(user_id: int) -> List[dict]:
     """Получает историю для пользователя. Создаёт новую, если её нет."""
     if user_id not in user_histories:
         user_histories[user_id] = [{"role": "system", "text": SYSTEM_PROMPT}]
+        # Инициализируем индекс сжатия для нового пользователя
+        user_last_compressed_idx[user_id] = -1
     return user_histories[user_id]
 
 
@@ -75,6 +85,7 @@ def clear_history(user_id: int):
     """Очищает историю пользователя."""
     user_histories[user_id] = [{"role": "system", "text": SYSTEM_PROMPT}]
     user_prev_input_tokens[user_id] = 0  # Сбрасываем счётчик токенов
+    user_last_compressed_idx[user_id] = -1  # Сбрасываем индекс сжатия
 
 def change_system_prompt(user_id: int, prompt: str):
     """Изменяет системный промпт для пользователя."""
@@ -109,6 +120,16 @@ def get_max_tokens(user_id: int) -> int:
 def set_max_tokens(user_id: int, max_tokens: int):
     """Устанавливает лимит токенов для пользователя."""
     user_max_tokens[user_id] = max_tokens
+
+
+def get_compress_trigger(user_id: int) -> int:
+    """Получает количество сообщений для триггера сжатия. 0 = отключено."""
+    return user_compress_trigger_turns.get(user_id, 10)  # По умолчанию 10 сообщений
+
+
+def set_compress_trigger(user_id: int, turns: int):
+    """Устанавливает количество сообщений для триггера сжатия. 0 = отключить сжатие."""
+    user_compress_trigger_turns[user_id] = turns
 
 
 @dataclass
@@ -189,6 +210,17 @@ def ask_agent(user_id: int, question: str) -> AgentResponse:
     temperature = get_temperature(user_id)
     max_tokens = get_max_tokens(user_id)
     
+    # Проверяем и сжимаем историю ПЕРЕД добавлением нового вопроса
+    compressed_before = check_and_compress_history(
+        user_id=user_id,
+        history=history,
+        last_compressed_idx=user_last_compressed_idx,
+        trigger_turns=user_compress_trigger_turns,
+        yandex_sdk=yandex_sdk,
+        hf_client=hf_client,
+        model=model
+    )
+    
     # Получаем предыдущее значение input_tokens для расчёта токенов сообщения
     prev_input_tokens = user_prev_input_tokens.get(user_id, 0)
     
@@ -223,6 +255,17 @@ def ask_agent(user_id: int, question: str) -> AgentResponse:
     # Добавляем ответ в историю
     history.append({"role": "assistant", "text": response_text})
     
+    # Проверяем и сжимаем историю ПОСЛЕ добавления ответа
+    compressed_after = check_and_compress_history(
+        user_id=user_id,
+        history=history,
+        last_compressed_idx=user_last_compressed_idx,
+        trigger_turns=user_compress_trigger_turns,
+        yandex_sdk=yandex_sdk,
+        hf_client=hf_client,
+        model=model
+    )
+    
     return AgentResponse(
         text=response_text,
         input_tokens=input_tokens,
@@ -251,7 +294,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/temperature - показать текущую температуру\n"
         "/set_temperature <0-1> - изменить температуру\n"
         "/max_tokens - показать лимит токенов\n"
-        "/set_max_tokens <число> - установить лимит токенов"
+        "/set_max_tokens <число> - установить лимит токенов\n"
+        "/compress_trigger - показать настройки сжатия истории\n"
+        "/set_compress_trigger <число> - установить триггер сжатия (0 = отключить)"
     )
 
 
@@ -420,6 +465,56 @@ async def handle_model_callback(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+async def cmd_compress_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /compress_trigger - показывает текущие настройки сжатия истории"""
+    user_id = update.effective_user.id
+    current_trigger = get_compress_trigger(user_id)
+    if current_trigger == 0:
+        await update.message.reply_text(
+            "📦 Сжатие истории: отключено\n\n"
+            "Используй /set_compress_trigger <число> для включения.\n"
+            "Например: /set_compress_trigger 10"
+        )
+    else:
+        await update.message.reply_text(
+            f"📦 Триггер сжатия истории: каждые {current_trigger} сообщений (user + assistant)\n\n"
+            "Используй /set_compress_trigger <число> для изменения.\n"
+            "Используй /set_compress_trigger 0 для отключения."
+        )
+
+
+async def cmd_set_compress_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /set_compress_trigger <число>"""
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        current_trigger = get_compress_trigger(user_id)
+        await update.message.reply_text(
+            f"📦 Текущий триггер: {current_trigger if current_trigger > 0 else 'отключено'}\n\n"
+            "Использование: /set_compress_trigger <число>\n"
+            "• 0 - отключить сжатие истории\n"
+            "• 5-50 - количество сообщений (user + assistant, каждое считается отдельно) до сжатия\n\n"
+            "Пример: /set_compress_trigger 10\n"
+            "(История будет сжиматься каждые 10 сообщений)"
+        )
+        return
+    
+    try:
+        new_trigger = int(context.args[0])
+        if new_trigger < 0:
+            raise ValueError("Триггер не может быть отрицательным")
+        
+        set_compress_trigger(user_id, new_trigger)
+        if new_trigger == 0:
+            await update.message.reply_text("📦 Сжатие истории отключено")
+        else:
+            await update.message.reply_text(
+                f"📦 Триггер сжатия установлен: каждые {new_trigger} сообщений"
+            )
+    except ValueError as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}\nУкажи целое число >= 0")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
     user_id = update.effective_user.id
@@ -464,6 +559,8 @@ def main():
     app.add_handler(CommandHandler("set_temperature", cmd_set_temperature))
     app.add_handler(CommandHandler("max_tokens", cmd_max_tokens))
     app.add_handler(CommandHandler("set_max_tokens", cmd_set_max_tokens))
+    app.add_handler(CommandHandler("compress_trigger", cmd_compress_trigger))
+    app.add_handler(CommandHandler("set_compress_trigger", cmd_set_compress_trigger))
     app.add_handler(CallbackQueryHandler(handle_model_callback, pattern="^model_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
