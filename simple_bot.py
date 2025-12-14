@@ -14,6 +14,7 @@ from yandex_cloud_ml_sdk import YCloudML
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from history_compressor import check_and_compress_history
+from local_storage import get_combined_summary, clear_summaries, get_summary_count
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -73,19 +74,58 @@ user_last_compressed_idx: Dict[int, int] = {}
 user_compress_trigger_turns: Dict[int, int] = {}
 
 def get_history(user_id: int) -> List[dict]:
-    """Получает историю для пользователя. Создаёт новую, если её нет."""
+    """
+    Получает историю для пользователя. Создаёт новую, если её нет.
+    При создании новой истории загружает суммаризацию из локального хранилища.
+    """
     if user_id not in user_histories:
         user_histories[user_id] = [{"role": "system", "text": SYSTEM_PROMPT}]
         # Инициализируем индекс сжатия для нового пользователя
         user_last_compressed_idx[user_id] = -1
+        
+        # Загружаем суммаризацию из локального хранилища, если есть
+        combined_summary = get_combined_summary(user_id)
+        if combined_summary:
+            summary_msg = {
+                "role": "system",
+                "name": "summary",
+                "text": f"Краткий конспект всех предыдущих частей диалога:\n{combined_summary}"
+            }
+            user_histories[user_id].append(summary_msg)
+            # Устанавливаем индекс сжатия на позицию summary
+            user_last_compressed_idx[user_id] = 1
+            print(f"✓ Загружена суммаризация из локального хранилища для user_id={user_id}")
+    
     return user_histories[user_id]
 
 
-def clear_history(user_id: int):
-    """Очищает историю пользователя."""
+def clear_history(user_id: int, clear_summaries_too: bool = False):
+    """
+    Очищает историю пользователя.
+    
+    Args:
+        user_id: ID пользователя
+        clear_summaries_too: Если True, также очищает сохраненные суммаризации
+    """
     user_histories[user_id] = [{"role": "system", "text": SYSTEM_PROMPT}]
     user_prev_input_tokens[user_id] = 0  # Сбрасываем счётчик токенов
     user_last_compressed_idx[user_id] = -1  # Сбрасываем индекс сжатия
+    
+    if clear_summaries_too:
+        clear_summaries(user_id)
+        print(f"✓ Суммаризации очищены для user_id={user_id}")
+    else:
+        # Загружаем существующую суммаризацию
+        combined_summary = get_combined_summary(user_id)
+        if combined_summary:
+            summary_msg = {
+                "role": "system",
+                "name": "summary",
+                "text": f"Краткий конспект всех предыдущих частей диалога:\n{combined_summary}"
+            }
+            user_histories[user_id].append(summary_msg)
+            user_last_compressed_idx[user_id] = 1
+            print(f"✓ Загружена суммаризация при очистке истории для user_id={user_id}")
 
 def change_system_prompt(user_id: int, prompt: str):
     """Изменяет системный промпт для пользователя."""
@@ -284,12 +324,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     user_id = update.effective_user.id
     clear_history(user_id)
+    
+    summary_count = get_summary_count(user_id)
+    summary_info = f"\n📦 Загружено суммаризаций из памяти: {summary_count}" if summary_count > 0 else ""
+    
     await update.message.reply_text(
-        "👋 Привет! Я простой бот-ассистент.\n\n"
+        f"👋 Привет! Я простой бот-ассистент.{summary_info}\n\n"
         "Просто напиши мне вопрос, и я отвечу.\n\n"
         "Команды:\n"
         "/model - выбрать модель (YandexGPT / DeepSeek)\n"
-        "/clear - очистить историю диалога\n"
+        "/clear - очистить историю (суммаризации сохраняются)\n"
+        "/clear all - полная очистка включая суммаризации\n"
         "/set_system_prompt <текст> - изменить системный промпт\n"
         "/temperature - показать текущую температуру\n"
         "/set_temperature <0-1> - изменить температуру\n"
@@ -301,10 +346,26 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /clear"""
+    """Обработчик команды /clear [all]"""
     user_id = update.effective_user.id
-    clear_history(user_id)
-    await update.message.reply_text("🗑 История очищена!")
+    
+    # Проверяем, нужно ли очистить также суммаризации
+    clear_all = context.args and context.args[0].lower() == "all"
+    
+    clear_history(user_id, clear_summaries_too=clear_all)
+    
+    summary_count = get_summary_count(user_id)
+    
+    if clear_all:
+        await update.message.reply_text("🗑 История и все суммаризации полностью очищены!")
+    elif summary_count > 0:
+        await update.message.reply_text(
+            f"🗑 История очищена!\n"
+            f"📦 Сохранено суммаризаций: {summary_count}\n\n"
+            "Используй /clear all для полной очистки включая суммаризации."
+        )
+    else:
+        await update.message.reply_text("🗑 История очищена!")
 
 
 async def cmd_set_system_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):

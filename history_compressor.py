@@ -7,6 +7,7 @@
 from typing import List, Dict, Tuple
 from yandex_cloud_ml_sdk import YCloudML
 from openai import OpenAI
+from local_storage import save_summary, get_combined_summary
 
 
 # Промпт для агента-суммаризатора
@@ -316,37 +317,44 @@ def check_and_compress_history(
             model=model
         )
         
-        # Создаём служебное сообщение с суммаризацией
+        # Сохраняем суммаризацию в локальное хранилище
+        save_summary(user_id, summary_text)
+        print(f"✓ Суммаризация сохранена в локальное хранилище для user_id={user_id}")
+        
+        # Получаем системный промпт (первый элемент истории)
+        system_prompt = history[0] if history and history[0].get("role") == "system" else None
+        
+        # Получаем последние сообщения после сжатого блока
+        remaining_messages = history[end_idx + 1:]
+        
+        # Загружаем объединенную суммаризацию из локального хранилища
+        combined_summary = get_combined_summary(user_id)
+        
+        # Создаём служебное сообщение с полной суммаризацией
         summary_msg = {
             "role": "system",
             "name": "summary",
-            "text": f"Краткий конспект предыдущей части диалога: {summary_text}"
+            "text": f"Краткий конспект всех предыдущих частей диалога:\n{combined_summary}"
         }
-
+        
         print(f"summary_msg: {summary_msg}")
         
-        # Заменяем блок истории на суммаризацию
-        # Удаляем старые сообщения и вставляем summary
-        new_history = history[:start_idx] + [summary_msg] + history[end_idx + 1:]
-        
-        # Обновляем историю
+        # Очищаем историю и создаём новую с суммаризацией
+        # Структура: [system_prompt, summary_msg, remaining_messages...]
         history.clear()
-        history.extend(new_history)
-
-        # Обновляем индекс последнего сжатия
-        # После сжатия summary находится на позиции start_idx в новой истории
-        # Это правильный индекс для отслеживания последнего сжатия
-        # ВАЖНО: обновляем словарь напрямую, чтобы изменения сохранились
-        old_value = last_compressed_idx.get(user_id, -999)
-        last_compressed_idx[user_id] = start_idx
-        new_value = last_compressed_idx[user_id]
+        if system_prompt:
+            history.append(system_prompt)
+        history.append(summary_msg)
+        history.extend(remaining_messages)
         
-        print(f"Обновление индекса: user_id={user_id}, старое значение={old_value}, новое значение={new_value}")
-        print(f"Размер новой истории: {len(history)}")
-        if start_idx < len(history):
-            summary_role = history[start_idx].get("role", "?")
-            summary_name = history[start_idx].get("name", "?")
-            print(f"Элемент на позиции {start_idx}: role={summary_role}, name={summary_name}")
+        # Сбрасываем индекс сжатия, т.к. история теперь начинается заново
+        # Индекс указывает на позицию summary_msg
+        summary_idx = 1 if system_prompt else 0
+        last_compressed_idx[user_id] = summary_idx
+        
+        print(f"✓ История очищена и пересоздана с суммаризацией")
+        print(f"  Размер новой истории: {len(history)}")
+        print(f"  last_compressed_idx[{user_id}] = {summary_idx}")
         print("=======")
         
         return True
