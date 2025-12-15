@@ -1,2 +1,6 @@
 .env
 new-env/
+/mcp-server-kotlin/build/
+summaries/
+.DS_Store
+__pycache__/
