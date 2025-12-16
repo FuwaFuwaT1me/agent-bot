@@ -4,3 +4,4 @@ new-env/
 summaries/
 .DS_Store
 __pycache__/
+/mcp-server-kotlin/.gradle/
