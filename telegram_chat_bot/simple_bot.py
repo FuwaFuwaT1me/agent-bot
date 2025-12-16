@@ -93,8 +93,17 @@ class McpClient:
         if arguments:
             params["arguments"] = arguments
         
-        result = await self._send_request("tools/call", params)
-        return result.get("result", {})
+        response = await self._send_request("tools/call", params)
+        
+        # Проверяем на ошибку JSON-RPC
+        if "error" in response and response["error"]:
+            error = response["error"]
+            return {
+                "content": [{"type": "text", "text": f"Error: {error.get('message', 'Unknown error')}"}],
+                "isError": True
+            }
+        
+        return response.get("result") or {}
 
 
 # Глобальный MCP клиент
@@ -650,6 +659,15 @@ async def cmd_mcp_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /mcp_tools - показывает список инструментов MCP сервера"""
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
+    # Примеры использования для каждого инструмента
+    tool_examples = {
+        "get_pokemon": "pikachu",
+        "get_type": "fire",
+        "get_move": "thunderbolt",
+        "get_ability": "static",
+        "list_pokemon": "10 0",
+    }
+    
     try:
         # Получаем список инструментов
         tools = await mcp_client.list_tools()
@@ -659,7 +677,7 @@ async def cmd_mcp_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         # Формируем красивый вывод
-        message = f"🔧 **MCP Tools** (сервер: {MCP_SERVER_URL})\n\n"
+        message = f"🔧 *MCP Tools*\n\n"
         
         for i, tool in enumerate(tools, 1):
             name = tool.get("name", "unknown")
@@ -668,22 +686,24 @@ async def cmd_mcp_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
             properties = input_schema.get("properties", {})
             required = input_schema.get("required", [])
             
-            message += f"**{i}. {name}**\n"
+            message += f"*{i}. {name}*\n"
             message += f"📝 {description}\n"
             
             if properties:
                 message += "📥 Параметры:\n"
                 for prop_name, prop_info in properties.items():
                     prop_type = prop_info.get("type", "any")
-                    prop_desc = prop_info.get("description", "")
                     is_required = "✅" if prop_name in required else "⬜"
-                    message += f"  {is_required} `{prop_name}` ({prop_type}): {prop_desc}\n"
+                    message += f"  {is_required} {prop_name} ({prop_type})\n"
+            
+            # Добавляем пример использования
+            example_arg = tool_examples.get(name, "")
+            if example_arg:
+                message += f"💡 `/mcp_call {name} {example_arg}`\n"
             else:
-                message += "📥 Параметры: нет\n"
+                message += f"💡 `/mcp_call {name}`\n"
             
             message += "\n"
-        
-        message += "💡 Используй /mcp_call <tool_name> [json_args] для вызова инструмента"
         
         await update.message.reply_text(message, parse_mode="Markdown")
         
@@ -698,16 +718,19 @@ async def cmd_mcp_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_mcp_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /mcp_call <tool_name> [json_args] - вызывает инструмент MCP"""
+    """Обработчик команды /mcp_call <tool_name> [args] - вызывает инструмент MCP"""
     if not context.args:
         await update.message.reply_text(
             "🔧 **Вызов MCP инструмента**\n\n"
             "Использование:\n"
-            "`/mcp_call <tool_name> [json_args]`\n\n"
+            "`/mcp_call <tool_name> [value]`\n"
+            "`/mcp_call <tool_name> {json}`\n\n"
             "Примеры:\n"
-            "`/mcp_call get_time`\n"
-            '`/mcp_call test_tool {"message": "Hello!"}`\n'
-            '`/mcp_call calculator {"operation": "add", "a": 5, "b": 3}`\n\n'
+            "`/mcp_call get_pokemon pikachu`\n"
+            "`/mcp_call get_type fire`\n"
+            "`/mcp_call get_move thunderbolt`\n"
+            "`/mcp_call list_pokemon 10 0`\n"
+            '`/mcp_call get_pokemon {"name": "charizard"}`\n\n'
             "Используй /mcp_tools для списка доступных инструментов.",
             parse_mode="Markdown"
         )
@@ -718,18 +741,42 @@ async def cmd_mcp_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tool_name = context.args[0]
     arguments = None
     
-    # Парсим JSON аргументы, если они есть
+    # Парсим аргументы
     if len(context.args) > 1:
-        json_str = " ".join(context.args[1:])
-        try:
-            arguments = json.loads(json_str)
-        except json.JSONDecodeError as e:
-            await update.message.reply_text(
-                f"❌ Ошибка парсинга JSON аргументов:\n`{e}`\n\n"
-                f"Входная строка: `{json_str}`",
-                parse_mode="Markdown"
-            )
-            return
+        args_str = " ".join(context.args[1:])
+        
+        # Проверяем, это JSON или простое значение
+        if args_str.startswith("{"):
+            # JSON формат
+            try:
+                arguments = json.loads(args_str)
+            except json.JSONDecodeError as e:
+                await update.message.reply_text(
+                    f"❌ Ошибка парсинга JSON:\n`{e}`\n\n"
+                    f"Входная строка: `{args_str}`",
+                    parse_mode="Markdown"
+                )
+                return
+        else:
+            # Простой формат: автоматически определяем параметр
+            # Для большинства инструментов это "name", для list_pokemon - limit/offset
+            if tool_name == "list_pokemon":
+                # /mcp_call list_pokemon [limit] [offset]
+                parts = args_str.split()
+                arguments = {}
+                if len(parts) >= 1:
+                    try:
+                        arguments["limit"] = int(parts[0])
+                    except ValueError:
+                        pass
+                if len(parts) >= 2:
+                    try:
+                        arguments["offset"] = int(parts[1])
+                    except ValueError:
+                        pass
+            else:
+                # Для остальных инструментов - параметр "name"
+                arguments = {"name": args_str}
     
     try:
         # Вызываем инструмент
@@ -737,14 +784,17 @@ async def cmd_mcp_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await mcp_client.call_tool(tool_name, arguments)
         elapsed = time.time() - start_time
         
-        # Формируем ответ
-        content = result.get("content", [])
+        # Формируем ответ (с защитой от None)
+        if result is None:
+            result = {}
+        
+        content = result.get("content", []) or []
         is_error = result.get("isError", False)
         
         # Извлекаем текст из content
         output_text = ""
         for item in content:
-            if item.get("type") == "text":
+            if isinstance(item, dict) and item.get("type") == "text":
                 output_text += item.get("text", "") + "\n"
         
         if not output_text:
@@ -752,13 +802,17 @@ async def cmd_mcp_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         status = "❌ Ошибка" if is_error else "✅ Успешно"
         
+        # Экранируем специальные символы Markdown в output_text
+        # (чтобы не ломать форматирование)
+        safe_output = output_text.replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+        
         message = (
-            f"🔧 **MCP Tool Call**\n\n"
+            f"🔧 *MCP Tool Call*\n\n"
             f"📛 Инструмент: `{tool_name}`\n"
             f"📥 Аргументы: `{json.dumps(arguments, ensure_ascii=False) if arguments else 'нет'}`\n"
             f"⏱ Время: {elapsed:.3f}s\n"
             f"📊 Статус: {status}\n\n"
-            f"📤 **Результат:**\n{output_text}"
+            f"📤 *Результат:*\n{safe_output}"
         )
         
         await update.message.reply_text(message, parse_mode="Markdown")
