@@ -31,8 +31,9 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 if not YANDEX_FOLDER_ID or not YANDEX_AUTH or not TELEGRAM_BOT_TOKEN:
     raise ValueError("Установите YANDEX_FOLDER_ID, YANDEX_AUTH и TELEGRAM_BOT_TOKEN в .env файле!")
 
-# MCP Server URL (Kotlin MCP Server)
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8080/mcp")
+# MCP Server URLs (Kotlin MCP Servers)
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8080/mcp")  # Calendar MCP
+MCP_EVENTS_URL = os.getenv("MCP_EVENTS_URL", "http://localhost:8081/mcp")  # KudaGo Events MCP
 
 # Daily reminder settings
 DAILY_REMINDER_HOUR = int(os.getenv("DAILY_REMINDER_HOUR", "9"))  # Default: 9:00 AM
@@ -114,8 +115,9 @@ class McpClient:
         return response.get("result") or {}
 
 
-# Глобальный MCP клиент
-mcp_client = McpClient(MCP_SERVER_URL)
+# Глобальные MCP клиенты
+mcp_client = McpClient(MCP_SERVER_URL)  # Calendar MCP
+mcp_events = McpClient(MCP_EVENTS_URL)  # KudaGo Events MCP
 
 
 # Доступные модели
@@ -412,22 +414,36 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 Привет! Я простой бот-ассистент.{summary_info}\n\n"
         "Просто напиши мне вопрос, и я отвечу.\n\n"
-        "Команды:\n"
-        "/model - выбрать модель (YandexGPT / DeepSeek)\n"
-        "/clear - очистить историю (суммаризации сохраняются)\n"
-        "/clear all - полная очистка включая суммаризации\n"
-        "/set_system_prompt <текст> - изменить системный промпт\n"
-        "/temperature - показать текущую температуру\n"
-        "/set_temperature <0-1> - изменить температуру\n"
-        "/max_tokens - показать лимит токенов\n"
-        "/set_max_tokens <число> - установить лимит токенов\n"
-        "/compress_trigger - показать настройки сжатия истории\n"
-        "/set_compress_trigger <число> - установить триггер сжатия (0 = отключить)\n\n"
-        "🔧 MCP инструменты:\n"
-        "/mcp_status - статус MCP сервера\n"
-        "/mcp_tools - список доступных инструментов\n"
-        "/mcp_call <tool> [args] - вызвать инструмент\n"
-        "/set_reminder - настройка ежедневных напоминаний"
+        "⚙️ *Настройки бота:*\n"
+        "/model — выбрать модель (YandexGPT / DeepSeek)\n"
+        "/clear — очистить историю\n"
+        "/clear all — полная очистка с суммаризациями\n"
+        "/set\\_system\\_prompt <текст> — системный промпт\n"
+        "/temperature — текущая температура\n"
+        "/set\\_temperature <0-1> — изменить температуру\n"
+        "/max\\_tokens — лимит токенов\n"
+        "/set\\_max\\_tokens <число> — установить лимит\n"
+        "/compress\\_trigger — настройки сжатия\n"
+        "/set\\_compress\\_trigger <число> — триггер сжатия\n\n"
+        "🔧 *MCP Calendar:*\n"
+        "/mcp\\_status — статус MCP сервера\n"
+        "/mcp\\_tools — список инструментов\n"
+        "/mcp\\_call <tool> [args] — вызвать инструмент\n"
+        "/set\\_reminder — ежедневные напоминания\n\n"
+        "🎫 *Pipeline (KudaGo → Яндекс Календарь):*\n"
+        "Автоматический поиск событий и добавление в календарь!\n\n"
+        "`/pipeline <категория> [город] [от] [до] [лимит]`\n\n"
+        "*Примеры:*\n"
+        "`/pipeline concert` — концерты в Москве\n"
+        "`/pipeline concert Moscow 7` — на 7 дней\n"
+        "`/pipeline theater spb 2025-12-25` — с 25 дек\n"
+        "`/pipeline concert Moscow 2025-12-25 2025-12-31 3`\n\n"
+        "*Категории:* concert, theater, exhibition, festival, party\n"
+        "*Города:* Moscow, spb, Kazan, ekb, nnv\n\n"
+        "/pipeline\\_cities — все города\n"
+        "/pipeline\\_categories — все категории\n"
+        "/pipeline\\_status — статус серверов",
+        parse_mode="Markdown"
     )
 
 
@@ -923,6 +939,497 @@ async def cmd_mcp_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка проверки статуса: {e}")
 
 
+# === PIPELINE COMMAND ===
+# Состояние pipeline для каждого пользователя
+user_pipeline_state: Dict[int, Dict[str, Any]] = {}
+
+async def cmd_pipeline(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Команда /pipeline - поиск событий KudaGo и АВТОМАТИЧЕСКОЕ добавление в календарь.
+    
+    Использование:
+    /pipeline <category> <city> [from_date] [to_date] [limit]
+    /pipeline concert Moscow
+    /pipeline theater spb 2025-12-25 2025-12-31 5
+    """
+    user_id = update.effective_user.id
+    
+    if not context.args:
+        await update.message.reply_text(
+            "🎫 *Pipeline: KudaGo → Яндекс Календарь*\n\n"
+            "Автоматический поиск событий и добавление в календарь!\n\n"
+            "*Использование:*\n"
+            "`/pipeline <категория> [город] [от] [до] [лимит]`\n\n"
+            "*Примеры:*\n"
+            "`/pipeline concert` — концерты в Москве на 30 дней\n"
+            "`/pipeline concert Moscow` — то же самое\n"
+            "`/pipeline concert Moscow 7` — на 7 дней вперёд\n"
+            "`/pipeline theater spb 2025-12-25` — с 25 декабря\n"
+            "`/pipeline theater spb 2025-12-25 2025-12-31` — с 25 по 31 дек\n"
+            "`/pipeline exhibition Kazan 2025-12-20 2025-12-30 3` — 3 события\n\n"
+            "*Форматы дат:*\n"
+            "• `7` или `30` — дней вперёд от сегодня\n"
+            "• `2025-12-25` — конкретная дата (YYYY-MM-DD)\n\n"
+            "*Категории:*\n"
+            "• `concert` — концерты\n"
+            "• `theater` — театр\n"
+            "• `exhibition` — выставки\n"
+            "• `festival` — фестивали\n"
+            "• `party` — вечеринки\n\n"
+            "*Города:*\n"
+            "• Moscow, spb, Kazan, ekb, nnv\n\n"
+            "`/pipeline_cities` — все города\n"
+            "`/pipeline_categories` — все категории",
+            parse_mode="Markdown"
+        )
+        return
+    
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    # Парсим аргументы
+    category = context.args[0] if len(context.args) >= 1 else "concert"
+    city = context.args[1] if len(context.args) >= 2 else "Moscow"
+    
+    # Парсим даты - могут быть в формате дней (7, 30) или дат (2025-12-25)
+    from datetime import datetime, timedelta
+    
+    from_date = None
+    to_date = None
+    limit = 5
+    
+    def parse_date_arg(arg: str) -> tuple:
+        """Возвращает (date или None, is_days_number)"""
+        if arg.isdigit():
+            # Это число дней
+            return int(arg), True
+        elif "-" in arg and len(arg) == 10:
+            # Это дата в формате YYYY-MM-DD
+            try:
+                return datetime.strptime(arg, "%Y-%m-%d").date(), False
+            except ValueError:
+                return None, False
+        return None, False
+    
+    # Аргумент 3: может быть from_date или days_ahead
+    if len(context.args) >= 3:
+        parsed, is_days = parse_date_arg(context.args[2])
+        if is_days and parsed:
+            # Это число дней
+            from_date = datetime.now().date()
+            to_date = from_date + timedelta(days=parsed)
+        elif parsed:
+            # Это дата начала
+            from_date = parsed
+    
+    # Аргумент 4: может быть to_date или limit
+    if len(context.args) >= 4:
+        parsed, is_days = parse_date_arg(context.args[3])
+        if is_days and parsed:
+            # Если from_date уже установлена как дата, это limit
+            if from_date and not to_date:
+                limit = parsed
+            else:
+                # Иначе это to_date как дни
+                to_date = datetime.now().date() + timedelta(days=parsed)
+        elif parsed:
+            # Это дата окончания
+            to_date = parsed
+    
+    # Аргумент 5: limit
+    if len(context.args) >= 5 and context.args[4].isdigit():
+        limit = int(context.args[4])
+    
+    # Если даты не указаны, используем по умолчанию 30 дней
+    if from_date is None:
+        from_date = datetime.now().date()
+    if to_date is None:
+        to_date = from_date + timedelta(days=30)
+    
+    # Вычисляем days_ahead для MCP
+    days_ahead = (to_date - datetime.now().date()).days
+    if days_ahead < 1:
+        days_ahead = 1
+    
+    # Форматируем даты для отображения
+    from_str = from_date.strftime("%d.%m.%Y") if hasattr(from_date, 'strftime') else str(from_date)
+    to_str = to_date.strftime("%d.%m.%Y") if hasattr(to_date, 'strftime') else str(to_date)
+    
+    status_msg = await update.message.reply_text(
+        f"🔍 *Шаг 1/2:* Ищу {category} в {city}...\n"
+        f"📅 Период: {from_str} — {to_str} (до {limit} событий)",
+        parse_mode="Markdown"
+    )
+    
+    # Форматируем даты для MCP (YYYY-MM-DD)
+    start_date_str = from_date.strftime("%Y-%m-%d") if hasattr(from_date, 'strftime') else str(from_date)
+    end_date_str = to_date.strftime("%Y-%m-%d") if hasattr(to_date, 'strftime') else str(to_date)
+    
+    try:
+        # ШАГ 1: Поиск событий через KudaGo MCP
+        search_result = await mcp_events.call_tool("search_events", {
+            "city": city,
+            "category": category,
+            "start_date": start_date_str,
+            "end_date": end_date_str,
+            "limit": limit
+        })
+        
+        if search_result.get("isError"):
+            content = search_result.get("content", [])
+            error_text = content[0].get("text", "Unknown error") if content else "Unknown error"
+            await status_msg.edit_text(f"❌ Ошибка поиска: {error_text}")
+            return
+        
+        # Извлекаем текст результата
+        content = search_result.get("content", [])
+        result_text = ""
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                result_text += item.get("text", "")
+        
+        if "No events found" in result_text or not result_text:
+            await status_msg.edit_text(
+                f"😔 Не найдено событий '{category}' в {city}.\n\n"
+                "Попробуйте другую категорию или город."
+            )
+            return
+        
+        # Парсим события
+        events = parse_events_from_result(result_text)
+        
+        if not events:
+            await status_msg.edit_text(
+                f"😔 Не удалось распарсить события.\n\n{result_text[:500]}"
+            )
+            return
+        
+        # Обновляем статус
+        await status_msg.edit_text(
+            f"✅ *Шаг 1/2:* Найдено {len(events)} событий!\n\n"
+            f"📅 *Шаг 2/2:* Добавляю в Яндекс Календарь...",
+            parse_mode="Markdown"
+        )
+        
+        # ШАГ 2: Добавляем все события в календарь
+        results = []
+        success_count = 0
+        
+        for event in events:
+            result = await add_event_to_calendar(event)
+            if "✅" in result:
+                success_count += 1
+            results.append(result)
+            # Небольшая задержка между запросами
+            await asyncio.sleep(0.3)
+        
+        # Формируем итоговое сообщение
+        summary = f"🎫 *Pipeline завершён!*\n\n"
+        summary += f"🔍 Категория: {category}\n"
+        summary += f"📍 Город: {city}\n"
+        summary += f"📊 Добавлено в календарь: {success_count}/{len(events)}\n\n"
+        summary += "━━━━━━━━━━━━━━━━━━━━━\n"
+        summary += "*Результаты:*\n\n"
+        
+        for r in results:
+            summary += f"{r}\n"
+        
+        # Сохраняем состояние для возможного повторного добавления
+        user_pipeline_state[user_id] = {
+            "events": events,
+            "category": category,
+            "city": city,
+            "raw_result": result_text
+        }
+        
+        try:
+            await status_msg.edit_text(summary, parse_mode="Markdown")
+        except Exception:
+            # Если сообщение слишком длинное, отправляем новое
+            await update.message.reply_text(summary.replace("*", ""))
+        
+    except httpx.ConnectError as e:
+        error_msg = str(e)
+        if "8081" in error_msg or "events" in error_msg.lower():
+            await status_msg.edit_text(
+                f"❌ KudaGo MCP сервер недоступен.\n\n"
+                f"Запустите: `java -jar mcp-ticketmaster-kotlin-1.0.0.jar --http 8081`",
+                parse_mode="Markdown"
+            )
+        else:
+            await status_msg.edit_text(
+                f"❌ Calendar MCP сервер недоступен.\n\n"
+                f"Запустите: `java -jar mcp-server-kotlin-1.0.0.jar --http 8080`",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка pipeline: {e}")
+
+
+def parse_events_from_result(result_text: str) -> List[Dict[str, Any]]:
+    """Парсит события из текстового результата KudaGo."""
+    events = []
+    lines = result_text.split("\n")
+    
+    current_event = {}
+    event_num = 0
+    
+    for line in lines:
+        line = line.strip()
+        
+        # Новое событие начинается с номера и эмодзи 🎫
+        if line and line[0].isdigit() and "🎫" in line:
+            if current_event and current_event.get("name"):
+                events.append(current_event)
+            event_num += 1
+            # Извлекаем название (после эмодзи)
+            name_part = line.split("🎫")[-1].strip() if "🎫" in line else line
+            current_event = {
+                "num": event_num,
+                "name": name_part,
+                "date": None,
+                "time": None,
+                "venue": None,
+                "address": None,
+                "id": None
+            }
+        
+        # Дата и время: "📅 2024-12-25 at 19:30"
+        elif "📅" in line and current_event:
+            date_part = line.replace("📅", "").strip()
+            if " at " in date_part:
+                parts = date_part.split(" at ")
+                current_event["date"] = parts[0].strip()
+                current_event["time"] = parts[1].strip()
+            else:
+                current_event["date"] = date_part
+        
+        # Venue name: "📍 Venue Name"
+        elif "📍" in line and current_event:
+            current_event["venue"] = line.replace("📍", "").strip()
+        
+        # Address: "🏠 Address"
+        elif "🏠" in line and current_event:
+            current_event["address"] = line.replace("🏠", "").strip()
+        
+        # Event ID: "🆔 ID: 12345"
+        elif "🆔" in line and "ID:" in line and current_event:
+            id_part = line.split("ID:")[-1].strip()
+            current_event["id"] = id_part
+    
+    # Добавляем последнее событие
+    if current_event and current_event.get("name"):
+        events.append(current_event)
+    
+    return events
+
+
+async def cmd_pipeline_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавляет выбранное событие в календарь."""
+    user_id = update.effective_user.id
+    
+    if user_id not in user_pipeline_state or not user_pipeline_state[user_id].get("events"):
+        await update.message.reply_text(
+            "❌ Нет сохраненных результатов поиска.\n\n"
+            "Сначала выполните поиск: `/pipeline rock Moscow`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Укажите номер события.\n\n"
+            "Пример: `/pipeline_add 1`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        event_num = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Номер должен быть числом.")
+        return
+    
+    events = user_pipeline_state[user_id]["events"]
+    
+    if event_num < 1 or event_num > len(events):
+        await update.message.reply_text(f"❌ Номер должен быть от 1 до {len(events)}.")
+        return
+    
+    event = events[event_num - 1]
+    
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    # Добавляем в календарь
+    result = await add_event_to_calendar(event)
+    await update.message.reply_text(result)
+
+
+async def cmd_pipeline_add_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Добавляет все найденные события в календарь."""
+    user_id = update.effective_user.id
+    
+    if user_id not in user_pipeline_state or not user_pipeline_state[user_id].get("events"):
+        await update.message.reply_text(
+            "❌ Нет сохраненных результатов поиска.\n\n"
+            "Сначала выполните поиск: `/pipeline rock Moscow`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    events = user_pipeline_state[user_id]["events"]
+    
+    await update.message.reply_text(f"📅 Добавляю {len(events)} событий в календарь...")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    results = []
+    success_count = 0
+    
+    for event in events:
+        result = await add_event_to_calendar(event)
+        results.append(f"• {event['name'][:30]}... — {'✅' if '✅' in result else '❌'}")
+        if "✅" in result:
+            success_count += 1
+        # Небольшая задержка между запросами
+        await asyncio.sleep(0.5)
+    
+    summary = f"📊 *Результат:* {success_count}/{len(events)} добавлено\n\n" + "\n".join(results)
+    
+    try:
+        await update.message.reply_text(summary, parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text(summary.replace("*", ""))
+
+
+async def add_event_to_calendar(event: Dict[str, Any]) -> str:
+    """Добавляет одно событие в календарь через Calendar MCP."""
+    name = event.get("name", "Event")
+    date = event.get("date")
+    time_str = event.get("time", "19:00")
+    venue = event.get("venue", "")
+    address = event.get("address", "")
+    
+    if not date or date == "TBD" or "Date TBD" in str(date):
+        return f"⏭️ {name[:30]}... — дата не определена, пропущено"
+    
+    # Парсим время
+    if time_str and time_str != "TBD" and "00:00" not in time_str:
+        start_time = time_str[:5] if len(time_str) >= 5 else time_str
+        # Вычисляем время окончания (+3 часа)
+        try:
+            hour = int(start_time.split(":")[0])
+            minute = start_time.split(":")[1] if ":" in start_time else "00"
+            end_hour = (hour + 3) % 24
+            end_time = f"{end_hour:02d}:{minute}"
+        except Exception:
+            end_time = "23:00"
+    else:
+        start_time = "19:00"
+        end_time = "22:00"
+    
+    # Формируем описание
+    description_parts = []
+    if venue:
+        description_parts.append(f"Место: {venue}")
+    if address:
+        description_parts.append(f"Адрес: {address}")
+    description = "\n".join(description_parts)
+    
+    try:
+        result = await mcp_client.call_tool("create_event", {
+            "title": name[:100],  # Ограничиваем длину
+            "date": date,
+            "start_time": start_time,
+            "end_time": end_time,
+            "description": description
+        })
+        
+        if result.get("isError"):
+            content = result.get("content", [])
+            error_text = content[0].get("text", "Error") if content else "Error"
+            return f"❌ {name[:30]}... — {error_text}"
+        
+        return f"✅ {name[:30]}... — добавлено на {date} {start_time}"
+        
+    except Exception as e:
+        return f"❌ {name[:30]}... — ошибка: {str(e)[:50]}"
+
+
+async def cmd_pipeline_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Очищает сохраненные результаты pipeline."""
+    user_id = update.effective_user.id
+    
+    if user_id in user_pipeline_state:
+        del user_pipeline_state[user_id]
+    
+    await update.message.reply_text("🗑️ Результаты поиска очищены.")
+
+
+async def cmd_pipeline_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает статус MCP серверов для pipeline."""
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    calendar_status = "❌ Offline"
+    events_status = "❌ Offline"
+    
+    # Проверяем Calendar MCP
+    try:
+        await mcp_client.initialize()
+        calendar_status = "✅ Online"
+    except Exception:
+        pass
+    
+    # Проверяем KudaGo Events MCP
+    try:
+        await mcp_events.initialize()
+        events_status = "✅ Online"
+    except Exception:
+        pass
+    
+    await update.message.reply_text(
+        f"🔗 *Pipeline Status*\n\n"
+        f"📅 Calendar MCP: {calendar_status}\n"
+        f"   `{MCP_SERVER_URL}`\n\n"
+        f"🎫 KudaGo Events MCP: {events_status}\n"
+        f"   `{MCP_EVENTS_URL}`\n\n"
+        f"{'✅ Pipeline готов к работе!' if calendar_status == '✅ Online' and events_status == '✅ Online' else '⚠️ Запустите оба MCP сервера для работы pipeline.'}",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_pipeline_cities(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает доступные города KudaGo."""
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    try:
+        result = await mcp_events.call_tool("list_cities", {})
+        content = result.get("content", [])
+        text = ""
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text += item.get("text", "")
+        
+        await update.message.reply_text(text or "Не удалось получить список городов")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+async def cmd_pipeline_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает доступные категории событий KudaGo."""
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    try:
+        result = await mcp_events.call_tool("list_categories", {})
+        content = result.get("content", [])
+        text = ""
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text += item.get("text", "")
+        
+        await update.message.reply_text(text or "Не удалось получить список категорий")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
     user_id = update.effective_user.id
@@ -1149,6 +1656,14 @@ def main():
     app.add_handler(CommandHandler("mcp_call", cmd_mcp_call))
     app.add_handler(CommandHandler("mcp_status", cmd_mcp_status))
     app.add_handler(CommandHandler("set_reminder", cmd_set_reminder))
+    # Pipeline команды (MCP chaining: KudaGo → Calendar)
+    app.add_handler(CommandHandler("pipeline", cmd_pipeline))
+    app.add_handler(CommandHandler("pipeline_add", cmd_pipeline_add))
+    app.add_handler(CommandHandler("pipeline_add_all", cmd_pipeline_add_all))
+    app.add_handler(CommandHandler("pipeline_clear", cmd_pipeline_clear))
+    app.add_handler(CommandHandler("pipeline_status", cmd_pipeline_status))
+    app.add_handler(CommandHandler("pipeline_cities", cmd_pipeline_cities))
+    app.add_handler(CommandHandler("pipeline_categories", cmd_pipeline_categories))
     app.add_handler(CallbackQueryHandler(handle_model_callback, pattern="^model_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
