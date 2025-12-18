@@ -28,14 +28,18 @@ dependencies {
     implementation("io.ktor:ktor-server-content-negotiation-jvm:2.3.7")
     implementation("io.ktor:ktor-server-cors-jvm:2.3.7")
     
-    // Ktor Client (for calling PokéAPI)
+    // Ktor Client (for calling Yandex Calendar API)
     implementation("io.ktor:ktor-client-core-jvm:2.3.7")
     implementation("io.ktor:ktor-client-cio-jvm:2.3.7")
     implementation("io.ktor:ktor-client-content-negotiation-jvm:2.3.7")
+    implementation("io.ktor:ktor-client-auth-jvm:2.3.7")
     implementation("io.ktor:ktor-serialization-kotlinx-json-jvm:2.3.7")
     
     // Logging
     implementation("ch.qos.logback:logback-classic:1.4.14")
+    
+    // Dotenv for loading .env files
+    implementation("io.github.cdimascio:dotenv-kotlin:6.4.1")
 }
 
 kotlin {

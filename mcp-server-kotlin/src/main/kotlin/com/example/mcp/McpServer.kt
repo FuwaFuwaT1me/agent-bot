@@ -5,18 +5,22 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.*
 
 /**
- * MCP Server implementation.
+ * MCP Server for Yandex Calendar.
  * Handles JSON-RPC 2.0 messages according to MCP specification.
  */
-class McpServer(private val tools: PokeApiTools = PokeApiTools()) {
-    
+class McpServer(
+    yandexUsername: String,
+    yandexAppPassword: String
+) {
     private val json = Json { 
         ignoreUnknownKeys = true 
         encodeDefaults = true
     }
     
+    private val calendarTools = CalendarTools(yandexUsername, yandexAppPassword)
+    
     private val serverInfo = ServerInfo(
-        name = "pokemon-mcp-server",
+        name = "yandex-calendar-mcp-server",
         version = "1.0.0"
     )
     
@@ -60,9 +64,7 @@ class McpServer(private val tools: PokeApiTools = PokeApiTools()) {
     }
     
     private fun handleInitialize(request: JsonRpcRequest): JsonRpcResponse {
-        // Log client info for debugging
-        val params = request.params?.let { json.decodeFromJsonElement<InitializeParams>(it) }
-        System.err.println("MCP: Client connected: ${params?.clientInfo?.name} v${params?.clientInfo?.version}")
+        System.err.println("MCP: Client connected")
         
         return JsonRpcResponse(
             id = request.id,
@@ -80,10 +82,10 @@ class McpServer(private val tools: PokeApiTools = PokeApiTools()) {
     }
     
     private fun handleToolsList(request: JsonRpcRequest): JsonRpcResponse {
-        System.err.println("MCP: Listing ${tools.tools.size} tools")
+        System.err.println("MCP: Listing ${calendarTools.tools.size} tools")
         return JsonRpcResponse(
             id = request.id,
-            result = json.encodeToJsonElement(ToolsListResult(tools = tools.tools))
+            result = json.encodeToJsonElement(ToolsListResult(tools = calendarTools.tools))
         )
     }
     
@@ -96,7 +98,23 @@ class McpServer(private val tools: PokeApiTools = PokeApiTools()) {
         
         System.err.println("MCP: Calling tool '${params.name}' with args: ${params.arguments}")
         
-        val result = runBlocking { tools.execute(params.name, params.arguments) }
+        // Convert JsonObject to Map<String, Any?>
+        val argsMap = params.arguments?.let { jsonObj ->
+            jsonObj.mapValues { (_, value) ->
+                when (value) {
+                    is JsonPrimitive -> when {
+                        value.isString -> value.content
+                        value.intOrNull != null -> value.int
+                        value.doubleOrNull != null -> value.double
+                        value.booleanOrNull != null -> value.boolean
+                        else -> value.content
+                    }
+                    else -> value.toString()
+                }
+            }
+        }
+        
+        val result = runBlocking { calendarTools.execute(params.name, argsMap) }
         
         return JsonRpcResponse(
             id = request.id,

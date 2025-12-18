@@ -1,93 +1,102 @@
-# Pokemon MCP Server (Kotlin)
+# Yandex Calendar MCP Server (Kotlin)
 
-A Model Context Protocol (MCP) server with Pokemon data from [PokéAPI](https://pokeapi.co).
+A Model Context Protocol (MCP) server for Yandex Calendar integration.
 
-## Two Transport Modes
+## Features
 
-### 1. STDIO Mode (for Claude Desktop, Cursor)
+- Get today's events
+- Get upcoming events (next N days)
+- Get events for specific date
+- Create new events
+- Daily summary with greeting
+
+## Setup
+
+### 1. Create Yandex App Password
+
+1. Go to https://id.yandex.ru/security/app-passwords
+2. Click "Create app password"
+3. Select "Calendar" as the app type
+4. Copy the generated password
+
+### 2. Set Environment Variables
+
 ```bash
-java -jar build/libs/mcp-server-kotlin-1.0.0.jar
+export YANDEX_USERNAME="your-yandex-login"
+export YANDEX_APP_PASSWORD="your-app-password"
 ```
-This is the "real" MCP way - communicates via stdin/stdout.
 
-### 2. HTTP Mode (for Telegram bot, curl testing)
-```bash
-java -jar build/libs/mcp-server-kotlin-1.0.0.jar --http 8080
-```
-Starts an HTTP server on port 8080.
-
-## Available Tools
-
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `get_pokemon` | Get Pokemon stats, types, abilities | `name` |
-| `get_type` | Get type damage relations | `name` |
-| `get_move` | Get move power, accuracy, effect | `name` |
-| `get_ability` | Get ability effect | `name` |
-| `list_pokemon` | List Pokemon with pagination | `limit`, `offset` |
-
-## Building
+### 3. Build
 
 ```bash
 cd mcp-server-kotlin
 ./gradlew jar
 ```
 
-## Usage with Claude Desktop
+## Usage
+
+### HTTP Mode (for Telegram bot)
+
+```bash
+java -jar build/libs/mcp-server-kotlin-1.0.0.jar --http 8080
+```
+
+### STDIO Mode (for Claude Desktop)
+
+```bash
+java -jar build/libs/mcp-server-kotlin-1.0.0.jar
+```
+
+## Available Tools
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `get_today_events` | Get all events for today | none |
+| `get_upcoming_events` | Get events for next N days | `days` (optional, default: 7) |
+| `get_events_for_date` | Get events for specific date | `date` (YYYY-MM-DD) |
+| `create_event` | Create a new event | `title`, `date`, `start_time`, `end_time`, `description` |
+| `get_daily_summary` | Get formatted daily summary | none |
+
+## Telegram Bot Commands
+
+```
+/mcp_tools - List available tools
+/mcp_call get_today_events
+/mcp_call get_upcoming_events 7
+/mcp_call get_events_for_date 2024-12-25
+/mcp_call get_daily_summary
+/mcp_call create_event Meeting 2024-12-20 14:00 15:00
+```
+
+## Claude Desktop Config
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
-    "pokemon": {
+    "calendar": {
       "command": "java",
-      "args": ["-jar", "/path/to/mcp-server-kotlin-1.0.0.jar"]
+      "args": ["-jar", "/path/to/mcp-server-kotlin-1.0.0.jar"],
+      "env": {
+        "YANDEX_USERNAME": "your-login",
+        "YANDEX_APP_PASSWORD": "your-app-password"
+      }
     }
   }
 }
 ```
 
-## Usage with Telegram Bot
-
-1. Start the server in HTTP mode:
-```bash
-java -jar build/libs/mcp-server-kotlin-1.0.0.jar --http 8080
-```
-
-2. Your bot connects to `http://localhost:8080/mcp`
-
-3. Use bot commands:
-```
-/mcp_tools
-/mcp_call get_pokemon {"name": "pikachu"}
-/mcp_call get_type {"name": "fire"}
-```
-
 ## Testing with curl
 
 ```bash
-# Health check
-curl http://localhost:8080/health
-
-# List tools
+# Get today's events
 curl -X POST http://localhost:8080/mcp \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_today_events","arguments":{}}}'
 
-# Get Pokemon
+# Get daily summary
 curl -X POST http://localhost:8080/mcp \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_pokemon","arguments":{"name":"pikachu"}}}'
-```
-
-## Project Structure
-
-```
-src/main/kotlin/com/example/mcp/
-├── Main.kt           # Entry point (stdio + http modes)
-├── McpServer.kt      # JSON-RPC message handling  
-├── McpProtocol.kt    # MCP protocol data types
-├── PokeApiTools.kt   # Tool definitions & execution
-└── PokeApiClient.kt  # HTTP client for PokéAPI
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_daily_summary","arguments":{}}}'
 ```

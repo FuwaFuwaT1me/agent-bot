@@ -8,6 +8,8 @@ import os
 import time
 import json
 import httpx
+import asyncio
+from datetime import time as dt_time, datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from dotenv import load_dotenv
@@ -31,6 +33,12 @@ if not YANDEX_FOLDER_ID or not YANDEX_AUTH or not TELEGRAM_BOT_TOKEN:
 
 # MCP Server URL (Kotlin MCP Server)
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8080/mcp")
+
+# Daily reminder settings
+DAILY_REMINDER_HOUR = int(os.getenv("DAILY_REMINDER_HOUR", "9"))  # Default: 9:00 AM
+DAILY_REMINDER_MINUTE = int(os.getenv("DAILY_REMINDER_MINUTE", "0"))  # Default: 0 minutes
+DAILY_REMINDER_CHAT_ID = os.getenv("DAILY_REMINDER_CHAT_ID")  # Your Telegram chat ID
+DAILY_REMINDER_TIMEZONE_OFFSET = int(os.getenv("DAILY_REMINDER_TIMEZONE_OFFSET", "3"))  # Default: Moscow (UTC+3)
 
 # === 1. СОЗДАНИЕ SDK КЛИЕНТОВ ===
 # YandexGPT
@@ -418,7 +426,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔧 MCP инструменты:\n"
         "/mcp_status - статус MCP сервера\n"
         "/mcp_tools - список доступных инструментов\n"
-        "/mcp_call <tool> [args] - вызвать инструмент"
+        "/mcp_call <tool> [args] - вызвать инструмент\n"
+        "/set_reminder - настройка ежедневных напоминаний"
     )
 
 
@@ -661,11 +670,13 @@ async def cmd_mcp_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Примеры использования для каждого инструмента
     tool_examples = {
-        "get_pokemon": "pikachu",
-        "get_type": "fire",
-        "get_move": "thunderbolt",
-        "get_ability": "static",
-        "list_pokemon": "10 0",
+        # Calendar tools
+        "get_today_events": "",
+        "get_upcoming_events": "7",
+        "get_events_for_date": "2024-12-25",
+        "create_event": "Spatb 2025-12-18 15:00 16:00",
+        "get_daily_summary": "",
+        "list_calendars": "",
     }
     
     try:
@@ -721,17 +732,16 @@ async def cmd_mcp_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /mcp_call <tool_name> [args] - вызывает инструмент MCP"""
     if not context.args:
         await update.message.reply_text(
-            "🔧 **Вызов MCP инструмента**\n\n"
-            "Использование:\n"
-            "`/mcp_call <tool_name> [value]`\n"
-            "`/mcp_call <tool_name> {json}`\n\n"
-            "Примеры:\n"
-            "`/mcp_call get_pokemon pikachu`\n"
-            "`/mcp_call get_type fire`\n"
-            "`/mcp_call get_move thunderbolt`\n"
-            "`/mcp_call list_pokemon 10 0`\n"
-            '`/mcp_call get_pokemon {"name": "charizard"}`\n\n'
-            "Используй /mcp_tools для списка доступных инструментов.",
+            "🔧 *Вызов MCP инструмента*\n\n"
+            "*Календарь:*\n"
+            "`/mcp_call get_today_events`\n"
+            "`/mcp_call get_upcoming_events 7`\n"
+            "`/mcp_call get_events_for_date 2024-12-25`\n"
+            "`/mcp_call create_event Встреча 2024-12-20 14:00 15:00`\n"
+            '`/mcp_call create_event "Team Sync" 2024-12-20 14:00 15:00`\n'
+            "`/mcp_call get_daily_summary`\n"
+            "`/mcp_call list_calendars`\n\n"
+            "Используй /mcp\\_tools для списка всех инструментов.",
             parse_mode="Markdown"
         )
         return
@@ -758,11 +768,11 @@ async def cmd_mcp_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
         else:
-            # Простой формат: автоматически определяем параметр
-            # Для большинства инструментов это "name", для list_pokemon - limit/offset
+            # Простой формат: автоматически определяем параметры
+            parts = args_str.split()
+            
             if tool_name == "list_pokemon":
                 # /mcp_call list_pokemon [limit] [offset]
-                parts = args_str.split()
                 arguments = {}
                 if len(parts) >= 1:
                     try:
@@ -774,6 +784,50 @@ async def cmd_mcp_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         arguments["offset"] = int(parts[1])
                     except ValueError:
                         pass
+            elif tool_name == "get_upcoming_events":
+                # /mcp_call get_upcoming_events [days]
+                arguments = {}
+                if len(parts) >= 1:
+                    try:
+                        arguments["days"] = int(parts[0])
+                    except ValueError:
+                        pass
+            elif tool_name == "get_events_for_date":
+                # /mcp_call get_events_for_date YYYY-MM-DD
+                arguments = {"date": parts[0]} if parts else {}
+            elif tool_name == "create_event":
+                # /mcp_call create_event title date start_time end_time [description]
+                # Example: /mcp_call create_event Meeting 2024-12-20 14:00 15:00 Team sync
+                # Or with quotes: /mcp_call create_event "Team Meeting" 2024-12-20 14:00 15:00
+                
+                # Check if title is quoted
+                import shlex
+                try:
+                    parsed_parts = shlex.split(args_str)
+                except ValueError:
+                    parsed_parts = parts
+                
+                if len(parsed_parts) >= 4:
+                    arguments = {
+                        "title": parsed_parts[0],
+                        "date": parsed_parts[1],
+                        "start_time": parsed_parts[2],
+                        "end_time": parsed_parts[3],
+                        "description": " ".join(parsed_parts[4:]) if len(parsed_parts) > 4 else ""
+                    }
+                else:
+                    await update.message.reply_text(
+                        "❌ Недостаточно параметров для create\\_event\n\n"
+                        "Формат: `/mcp_call create_event title date start end [desc]`\n\n"
+                        "Примеры:\n"
+                        "`/mcp_call create_event Meeting 2024-12-20 14:00 15:00`\n"
+                        '`/mcp_call create_event "Team Sync" 2024-12-20 14:00 15:00 Weekly`',
+                        parse_mode="Markdown"
+                    )
+                    return
+            elif tool_name in ["get_today_events", "get_daily_summary"]:
+                # Эти инструменты не требуют параметров
+                arguments = {}
             else:
                 # Для остальных инструментов - параметр "name"
                 arguments = {"name": args_str}
@@ -899,6 +953,181 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
 
+# === DAILY REMINDER ===
+
+async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет ежедневную сводку из календаря"""
+    if not DAILY_REMINDER_CHAT_ID:
+        print("⚠️ DAILY_REMINDER_CHAT_ID не установлен, пропускаем напоминание")
+        return
+    
+    try:
+        # Получаем daily summary из MCP сервера
+        result = await mcp_client.call_tool("get_daily_summary", {})
+        
+        if result is None:
+            result = {}
+        
+        content = result.get("content", []) or []
+        
+        # Извлекаем текст
+        message_text = ""
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                message_text += item.get("text", "")
+        
+        if not message_text:
+            message_text = "📅 Не удалось получить сводку на сегодня"
+        
+        # Отправляем сообщение
+        await context.bot.send_message(
+            chat_id=int(DAILY_REMINDER_CHAT_ID),
+            text=message_text
+        )
+        print(f"✅ Daily reminder sent to chat {DAILY_REMINDER_CHAT_ID}")
+        
+    except Exception as e:
+        print(f"❌ Error sending daily reminder: {e}")
+
+
+async def cmd_set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /set_reminder - управление ежедневными напоминаниями"""
+    global DAILY_REMINDER_CHAT_ID, DAILY_REMINDER_HOUR, DAILY_REMINDER_MINUTE
+    
+    chat_id = update.effective_chat.id
+    
+    # Показываем текущие настройки
+    if not context.args:
+        current_status = "✅ включены" if DAILY_REMINDER_CHAT_ID else "❌ отключены"
+        
+        # Check if there's a scheduled job
+        jobs = context.job_queue.get_jobs_by_name("daily_reminder") if context.job_queue else []
+        job_status = f"✅ запланировано ({len(jobs)} job)" if jobs else "❌ не запланировано"
+        
+        await update.message.reply_text(
+            f"⏰ *Ежедневные напоминания*\n\n"
+            f"Статус: {current_status}\n"
+            f"Job: {job_status}\n"
+            f"Время: {DAILY_REMINDER_HOUR}:{DAILY_REMINDER_MINUTE:02d} (UTC+{DAILY_REMINDER_TIMEZONE_OFFSET})\n"
+            f"Chat ID: `{chat_id}`\n\n"
+            f"*Команды:*\n"
+            f"`/set_reminder HH:MM` - установить время\n"
+            f"`/set_reminder on` - включить для этого чата\n"
+            f"`/set_reminder off` - отключить\n"
+            f"`/set_reminder test` - тестовая отправка",
+            parse_mode="Markdown"
+        )
+        return
+    
+    arg = context.args[0].lower()
+    
+    # Включить напоминания для текущего чата
+    if arg == "on":
+        DAILY_REMINDER_CHAT_ID = str(chat_id)
+        
+        # Schedule the job if not already scheduled
+        if context.job_queue:
+            # Remove existing jobs
+            for job in context.job_queue.get_jobs_by_name("daily_reminder"):
+                job.schedule_removal()
+            
+            # Add new job
+            tz = timezone(timedelta(hours=DAILY_REMINDER_TIMEZONE_OFFSET))
+            reminder_time = dt_time(hour=DAILY_REMINDER_HOUR, minute=DAILY_REMINDER_MINUTE, second=0, tzinfo=tz)
+            context.job_queue.run_daily(send_daily_reminder, time=reminder_time, name="daily_reminder")
+        
+        await update.message.reply_text(
+            f"✅ Напоминания включены!\n\n"
+            f"Время: {DAILY_REMINDER_HOUR}:{DAILY_REMINDER_MINUTE:02d}\n"
+            f"Chat ID: {chat_id}"
+        )
+        return
+    
+    # Отключить напоминания
+    if arg == "off":
+        DAILY_REMINDER_CHAT_ID = None
+        
+        # Remove scheduled jobs
+        if context.job_queue:
+            for job in context.job_queue.get_jobs_by_name("daily_reminder"):
+                job.schedule_removal()
+        
+        await update.message.reply_text("❌ Напоминания отключены")
+        return
+    
+    # Тестовая отправка
+    if arg == "test":
+        await update.message.reply_text("📤 Отправляю тестовое напоминание...")
+        
+        try:
+            result = await mcp_client.call_tool("get_daily_summary", {})
+            
+            if result is None:
+                result = {}
+            
+            content = result.get("content", []) or []
+            message_text = ""
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    message_text += item.get("text", "")
+            
+            if not message_text:
+                message_text = "📅 Не удалось получить сводку"
+            
+            await update.message.reply_text(message_text)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+    
+    # Установить время (формат HH:MM)
+    if ":" in arg:
+        try:
+            parts = arg.split(":")
+            hour = int(parts[0])
+            minute = int(parts[1])
+            
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError("Invalid time")
+            
+            DAILY_REMINDER_HOUR = hour
+            DAILY_REMINDER_MINUTE = minute
+            
+            # Reschedule the job if active
+            if DAILY_REMINDER_CHAT_ID and context.job_queue:
+                # Remove existing jobs
+                for job in context.job_queue.get_jobs_by_name("daily_reminder"):
+                    job.schedule_removal()
+                
+                # Add new job with updated time
+                tz = timezone(timedelta(hours=DAILY_REMINDER_TIMEZONE_OFFSET))
+                reminder_time = dt_time(hour=DAILY_REMINDER_HOUR, minute=DAILY_REMINDER_MINUTE, second=0, tzinfo=tz)
+                context.job_queue.run_daily(send_daily_reminder, time=reminder_time, name="daily_reminder")
+            
+            await update.message.reply_text(
+                f"✅ Время напоминания установлено: {hour:02d}:{minute:02d}\n\n"
+                f"{'Напоминание перезапланировано.' if DAILY_REMINDER_CHAT_ID else 'Используй /set_reminder on для включения.'}"
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Неверный формат времени.\n\n"
+                "Используй: `/set_reminder HH:MM`\n"
+                "Пример: `/set_reminder 09:30`",
+                parse_mode="Markdown"
+            )
+        return
+    
+    await update.message.reply_text(
+        "❓ Неизвестная команда.\n\n"
+        "Используй:\n"
+        "`/set_reminder` - показать статус\n"
+        "`/set_reminder HH:MM` - установить время\n"
+        "`/set_reminder on` - включить\n"
+        "`/set_reminder off` - отключить\n"
+        "`/set_reminder test` - тест",
+        parse_mode="Markdown"
+    )
+
+
 def main():
     """Запуск бота"""
     # Создаём приложение
@@ -919,8 +1148,20 @@ def main():
     app.add_handler(CommandHandler("mcp_tools", cmd_mcp_tools))
     app.add_handler(CommandHandler("mcp_call", cmd_mcp_call))
     app.add_handler(CommandHandler("mcp_status", cmd_mcp_status))
+    app.add_handler(CommandHandler("set_reminder", cmd_set_reminder))
     app.add_handler(CallbackQueryHandler(handle_model_callback, pattern="^model_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Настраиваем ежедневное напоминание
+    if DAILY_REMINDER_CHAT_ID:
+        job_queue = app.job_queue
+        # Create timezone with offset
+        tz = timezone(timedelta(hours=DAILY_REMINDER_TIMEZONE_OFFSET))
+        reminder_time = dt_time(hour=DAILY_REMINDER_HOUR, minute=DAILY_REMINDER_MINUTE, second=0, tzinfo=tz)
+        job_queue.run_daily(send_daily_reminder, time=reminder_time, name="daily_reminder")
+        print(f"⏰ Daily reminder scheduled at {DAILY_REMINDER_HOUR}:{DAILY_REMINDER_MINUTE:02d} (UTC+{DAILY_REMINDER_TIMEZONE_OFFSET}) for chat {DAILY_REMINDER_CHAT_ID}")
+    else:
+        print("⚠️ Daily reminder disabled (DAILY_REMINDER_CHAT_ID not set)")
     
     # Запускаем
     print("🤖 Бот запущен!")
