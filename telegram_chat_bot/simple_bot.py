@@ -9,16 +9,21 @@ import time
 import json
 import httpx
 import asyncio
+import shlex
+import io
 from datetime import time as dt_time, datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from dotenv import load_dotenv
+import shutil
+import platform
 from openai import OpenAI
 from yandex_cloud_ml_sdk import YCloudML
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from history_compressor import check_and_compress_history
 from local_storage import get_combined_summary, clear_summaries, get_summary_count
+from mobile_mcp import MobileMcpService, pick_tool_name, parse_kv_args, extract_images_from_mcp_result, extract_text_from_mcp_result, safe_call
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -34,6 +39,9 @@ if not YANDEX_FOLDER_ID or not YANDEX_AUTH or not TELEGRAM_BOT_TOKEN:
 # MCP Server URLs (Kotlin MCP Servers)
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8080/mcp")  # Calendar MCP
 MCP_EVENTS_URL = os.getenv("MCP_EVENTS_URL", "http://localhost:8081/mcp")  # KudaGo Events MCP
+
+# Mobile MCP (stdio, Node)
+MOBILE_MCP_COMMAND = os.getenv("MOBILE_MCP_COMMAND", "npx -y @mobilenext/mobile-mcp@latest")
 
 # Daily reminder settings
 DAILY_REMINDER_HOUR = int(os.getenv("DAILY_REMINDER_HOUR", "9"))  # Default: 9:00 AM
@@ -118,6 +126,10 @@ class McpClient:
 # Глобальные MCP клиенты
 mcp_client = McpClient(MCP_SERVER_URL)  # Calendar MCP
 mcp_events = McpClient(MCP_EVENTS_URL)  # KudaGo Events MCP
+mobile_mcp_service = MobileMcpService(command=shlex.split(MOBILE_MCP_COMMAND))
+
+# Selected Mobile MCP device per chat (so /mobile_call can auto-inject {"device": "..."}).
+mobile_selected_device: Dict[int, str] = {}
 
 
 # Доступные модели
@@ -430,6 +442,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/mcp\\_tools — список инструментов\n"
         "/mcp\\_call <tool> [args] — вызвать инструмент\n"
         "/set\\_reminder — ежедневные напоминания\n\n"
+        "📱 *Mobile MCP (эмулятор / симулятор):*\n"
+        "/mobile\\_start — запустить Mobile MCP (npx)\n"
+        "/mobile\\_status — статус Mobile MCP\n"
+        "/mobile\\_tools — список инструментов Mobile MCP\n"
+        "/mobile\\_devices — список устройств (device ids)\n"
+        "/mobile\\_use <device> — выбрать устройство для вызовов\n"
+        "/mobile\\_call <tool> [json|k=v] — вызвать tool\n"
+        "/tap <x> <y> — тап по координатам (если tool доступен)\n"
+        "/screenshot — скриншот экрана (если tool доступен)\n"
+        "/android\\_avds — список Android AVD\n"
+        "/android\\_boot <avd> [headless] — запуск эмулятора\n"
+        "/android\\_status — статус эмулятора (из бота)\n"
+        "/android\\_stop — остановка эмулятора\n"
+        "/ios\\_devices — список iOS Simulator устройств\n"
+        "/ios\\_boot <name|udid> — boot iOS Simulator\n"
+        "/ios\\_open — открыть приложение Simulator\n\n"
         "🎫 *Pipeline (KudaGo → Яндекс Календарь):*\n"
         "Автоматический поиск событий и добавление в календарь!\n\n"
         "`/pipeline <категория> [город] [от] [до] [лимит]`\n\n"
@@ -937,6 +965,456 @@ async def cmd_mcp_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка проверки статуса: {e}")
+
+
+# === MOBILE MCP (stdio) COMMANDS ===
+
+async def cmd_mobile_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    try:
+        info = await mobile_mcp_service.ensure_started()
+        await update.message.reply_text(
+            "🟢 *Mobile MCP started*\n\n"
+            "_Примечание: это запускает MCP сервер. Эмулятор/симулятор запускается отдельными командами:_\n"
+            "`/android_boot ...` или `/ios_boot ...`\n\n"
+            f"📛 {info.name}\n"
+            f"📦 {info.version}\n"
+            f"📋 Protocol: {info.protocol_version}\n",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        stderr = mobile_mcp_service.recent_stderr()
+        extra = f"\n\nstderr:\n{stderr[-1500:]}" if stderr else ""
+        await update.message.reply_text(f"❌ Mobile MCP start error: {e}{extra}")
+
+
+async def cmd_mobile_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    try:
+        await mobile_mcp_service.stop()
+        await update.message.reply_text("🛑 Mobile MCP stopped")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Mobile MCP stop error: {e}")
+
+
+async def cmd_mobile_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    running = mobile_mcp_service.client.is_running
+    inited = mobile_mcp_service.client.initialized
+    stderr = mobile_mcp_service.recent_stderr().strip()
+    msg = (
+        "📱 *Mobile MCP Status*\n\n"
+        f"Running: {'✅' if running else '❌'}\n"
+        f"Initialized: {'✅' if inited else '❌'}\n"
+        f"Command: `{MOBILE_MCP_COMMAND}`\n"
+    )
+    if stderr:
+        msg += f"\nRecent stderr (tail):\n`{stderr[-800:]}`"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_mobile_tools(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    try:
+        tools = await mobile_mcp_service.list_tools()
+        if not tools:
+            await update.message.reply_text("🔧 Mobile MCP server does not expose tools.")
+            return
+
+        # IMPORTANT: send as plain text (no Markdown) because tool names/descriptions
+        # may contain characters that break Telegram entity parsing.
+        header = "🔧 Mobile MCP Tools\n\n"
+        footer = (
+            "\n\nПример:\n"
+            "/mobile_call <tool> {\"x\":10,\"y\":20}\n"
+            "/mobile_call <tool> x=10 y=20"
+        )
+
+        max_tools = 120
+        lines: List[str] = []
+        for i, t in enumerate(tools[:max_tools], 1):
+            name = str(t.get("name", "unknown"))
+            desc = str(t.get("description", "") or "")
+            line = f"{i}) {name}"
+            if desc:
+                # keep lines bounded
+                if len(desc) > 240:
+                    desc = desc[:240] + "…"
+                line += f" — {desc}"
+            lines.append(line)
+
+        if len(tools) > max_tools:
+            lines.append(f"\n… and {len(tools) - max_tools} more")
+
+        text = header + "\n".join(lines) + footer
+
+        # Telegram message limit ~4096 chars: chunk safely
+        chunk_size = 3500
+        for start in range(0, len(text), chunk_size):
+            await update.message.reply_text(text[start : start + chunk_size])
+    except Exception as e:
+        stderr = mobile_mcp_service.recent_stderr()
+        extra = f"\n\nstderr:\n{stderr[-1500:]}" if stderr else ""
+        await update.message.reply_text(f"❌ Mobile tools error: {e}{extra}")
+
+
+async def cmd_mobile_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n"
+            "`/mobile_call <tool> {\"k\":\"v\"}`\n"
+            "`/mobile_call <tool> k=v k2=v2`\n"
+            "\nСписок tools: /mobile_tools",
+            parse_mode="Markdown",
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    tool = context.args[0]
+    arg_str = " ".join(context.args[1:]).strip()
+
+    args_obj: Optional[Dict[str, Any]] = None
+    if arg_str:
+        if arg_str.startswith("{"):
+            try:
+                args_obj = json.loads(arg_str)
+            except json.JSONDecodeError as e:
+                await update.message.reply_text(f"❌ JSON parse error: {e}\n`{arg_str}`", parse_mode="Markdown")
+                return
+        elif "=" in arg_str:
+            args_obj = parse_kv_args(arg_str)
+        else:
+            # Best-effort convenience for common patterns.
+            # Prefer explicit JSON via /mobile_tool <name> to see exact schema.
+            if "open_url" in tool.lower() or tool.lower().endswith("openurl"):
+                url = arg_str.strip()
+                if url and "://" not in url:
+                    url = "https://" + url
+                args_obj = {"url": url}
+            else:
+                # fallback: many tools accept `text`
+                args_obj = {"text": arg_str}
+
+    # IMPORTANT: Mobile MCP expects an object for arguments (even if empty).
+    if args_obj is None:
+        args_obj = {}
+
+    # Auto-inject selected device if not provided.
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is not None and "device" not in args_obj and chat_id in mobile_selected_device:
+        args_obj["device"] = mobile_selected_device[chat_id]
+
+    result = await safe_call(mobile_mcp_service, tool, args_obj)
+    # Some Mobile MCP tools model "no args" as a required `noParams` object.
+    # If we see that validation error, retry once with {"noParams": {}} merged.
+    if result.get("isError"):
+        err_text = extract_text_from_mcp_result(result)
+        if "noParams" in err_text and "expected object" in err_text and "received undefined" in err_text:
+            retry_args = dict(args_obj)
+            retry_args.setdefault("noParams", {})
+            result = await safe_call(mobile_mcp_service, tool, retry_args)
+            args_obj = retry_args
+    text = extract_text_from_mcp_result(result)
+    is_error = bool(result.get("isError"))
+    status = "❌ Ошибка" if is_error else "✅ Успешно"
+
+    images = extract_images_from_mcp_result(result)
+    if images:
+        # send images first
+        for idx, (raw, mime) in enumerate(images, 1):
+            bio = io.BytesIO(raw)
+            bio.seek(0)
+            filename = f"mobile_screen_{idx}.png" if "png" in mime else f"mobile_screen_{idx}.jpg"
+            input_file = InputFile(bio, filename=filename)
+            if mime.startswith("image/"):
+                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=input_file)
+            else:
+                await context.bot.send_document(chat_id=update.effective_chat.id, document=input_file)
+
+    if not text:
+        text = json.dumps(result, ensure_ascii=False, indent=2)[:3500]
+    await update.message.reply_text(
+        f"🔧 *Mobile MCP Tool Call*\n\n"
+        f"📛 Tool: `{tool}`\n"
+        f"📥 Args: `{json.dumps(args_obj, ensure_ascii=False)}`\n"
+        f"📊 Статус: {status}\n\n"
+        f"📤 Результат:\n{text}",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_mobile_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Best-effort: find a tool that lists devices and call it.
+    Different Mobile MCP versions may expose different names.
+    """
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    tools = await mobile_mcp_service.list_tools()
+    candidates = [
+        "mobile_list_devices",
+        "mobile_devices",
+        "list_devices",
+        "get_devices",
+        "devices_list",
+        "mobile_connected_devices",
+        "mobile_list_connected_devices",
+    ]
+    tool_name = pick_tool_name(tools, candidates)
+    if not tool_name:
+        # Fallback: find any tool containing "device" + "list"
+        for t in tools:
+            name = str(t.get("name", ""))
+            if "device" in name.lower() and "list" in name.lower():
+                tool_name = name
+                break
+
+    if not tool_name:
+        await update.message.reply_text(
+            "❌ Не нашёл tool для списка устройств.\n"
+            "Сделай /mobile_tools и найди tool, который возвращает devices, затем вызови его через /mobile_call."
+        )
+        return
+
+    args_obj: Dict[str, Any] = {}
+    result = await safe_call(mobile_mcp_service, tool_name, args_obj)
+    if result.get("isError"):
+        err_text = extract_text_from_mcp_result(result)
+        if "noParams" in err_text and "expected object" in err_text and "received undefined" in err_text:
+            args_obj = {"noParams": {}}
+            result = await safe_call(mobile_mcp_service, tool_name, args_obj)
+
+    text = extract_text_from_mcp_result(result) or json.dumps(result, ensure_ascii=False, indent=2)
+
+    msg = (
+        f"📱 Mobile devices (tool: {tool_name})\n"
+        f"Args: {json.dumps(args_obj, ensure_ascii=False)}\n\n"
+        f"{text}\n\n"
+        "Выбери device id и сделай:\n"
+        "/mobile_use <device>\n\n"
+        "Потом можно вызывать:\n"
+        "/mobile_call mobile_list_apps\n"
+        "/mobile_call mobile_open_url google.com"
+    )
+    for start in range(0, len(msg), 3500):
+        await update.message.reply_text(msg[start : start + 3500])
+
+
+async def cmd_mobile_use(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Select current device for this chat.
+    Usage: /mobile_use <device>
+    """
+    if not context.args:
+        await update.message.reply_text("Использование: /mobile_use <device>")
+        return
+    device = " ".join(context.args).strip()
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
+        await update.message.reply_text("❌ Не удалось определить chat_id")
+        return
+    mobile_selected_device[chat_id] = device
+    await update.message.reply_text(f"✅ Selected device: {device}\n\nТеперь /mobile_call будет подставлять device автоматически.")
+
+
+async def cmd_mobile_tool(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Show tool description + input schema (plain text).
+    Usage: /mobile_tool <name>
+    """
+    if not context.args:
+        await update.message.reply_text("Использование: /mobile_tool <tool_name>")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    name = context.args[0]
+    tools = await mobile_mcp_service.list_tools()
+    found = None
+    for t in tools:
+        if str(t.get("name", "")) == name:
+            found = t
+            break
+    if not found:
+        # try case-insensitive
+        for t in tools:
+            if str(t.get("name", "")).lower() == name.lower():
+                found = t
+                break
+    if not found:
+        await update.message.reply_text("❌ Tool not found. Use /mobile_tools to list tools.")
+        return
+
+    desc = str(found.get("description", "") or "")
+    schema = found.get("inputSchema", {}) or {}
+    payload = {
+        "name": found.get("name"),
+        "description": desc,
+        "inputSchema": schema,
+    }
+    text = "🔎 Mobile MCP Tool\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    # Chunk to avoid Telegram limit
+    for start in range(0, len(text), 3500):
+        await update.message.reply_text(text[start : start + 3500])
+
+
+async def cmd_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: `/tap <x> <y>`", parse_mode="Markdown")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    try:
+        x = int(context.args[0])
+        y = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("❌ x и y должны быть числами")
+        return
+
+    tools = await mobile_mcp_service.list_tools()
+    tool = pick_tool_name(tools, ["tap", "click", "touch", "input_tap"])
+    if not tool:
+        await update.message.reply_text("❌ Не нашёл tool для tap. Проверь /mobile_tools и используй /mobile_call.")
+        return
+
+    result = await safe_call(mobile_mcp_service, tool, {"x": x, "y": y})
+    text = extract_text_from_mcp_result(result) or "ok"
+    await update.message.reply_text(f"✅ tap via `{tool}`: {text}", parse_mode="Markdown")
+
+
+async def cmd_screenshot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    tools = await mobile_mcp_service.list_tools()
+    tool = pick_tool_name(tools, ["screenshot", "take_screenshot", "screen_capture", "capture_screenshot"])
+    if not tool:
+        await update.message.reply_text("❌ Не нашёл tool для screenshot. Проверь /mobile_tools и используй /mobile_call.")
+        return
+
+    result = await safe_call(mobile_mcp_service, tool, {})
+    images = extract_images_from_mcp_result(result)
+    if not images:
+        # Sometimes servers return base64 in text; show raw text then.
+        text = extract_text_from_mcp_result(result) or json.dumps(result, ensure_ascii=False, indent=2)[:3500]
+        await update.message.reply_text(f"📸 `{tool}` result:\n{text}", parse_mode="Markdown")
+        return
+
+    for idx, (raw, mime) in enumerate(images, 1):
+        bio = io.BytesIO(raw)
+        bio.seek(0)
+        filename = f"screenshot_{idx}.png" if "png" in mime else f"screenshot_{idx}.jpg"
+        input_file = InputFile(bio, filename=filename)
+        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=input_file)
+
+    text = extract_text_from_mcp_result(result)
+    if text:
+        await update.message.reply_text(text)
+
+
+# === Emulator commands ===
+
+async def cmd_android_avds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    avds = await mobile_mcp_service.android_list_avds()
+    if not avds:
+        await update.message.reply_text(
+            "❌ Не удалось получить список AVD.\n"
+            "Проверь, что Android Emulator доступен в PATH, или задай ANDROID_EMULATOR_BIN."
+        )
+        return
+    await update.message.reply_text("📱 Android AVD:\n" + "\n".join([f"- {a}" for a in avds]))
+
+
+async def cmd_android_boot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: `/android_boot <avd> [headless]`", parse_mode="Markdown")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    avd = context.args[0]
+    headless = len(context.args) > 1 and context.args[1].lower() in ("1", "true", "yes", "headless")
+    msg = await mobile_mcp_service.android_boot(avd, headless=headless)
+    await update.message.reply_text(msg)
+
+
+async def cmd_android_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    msg = await mobile_mcp_service.android_stop()
+    await update.message.reply_text(msg)
+
+async def cmd_android_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    proc = mobile_mcp_service.emulator.android_proc
+    avd = mobile_mcp_service.emulator.android_avd
+    running = bool(proc and proc.returncode is None)
+    last_err = (mobile_mcp_service.emulator.android_last_error or "").strip()
+
+    msg = (
+        "📱 Android Emulator Status\n\n"
+        f"Running: {'YES' if running else 'NO'}\n"
+        f"AVD: {avd or '-'}\n"
+    )
+    if proc and proc.returncode is not None:
+        msg += f"Exit code: {proc.returncode}\n"
+    if last_err:
+        msg += "\nLast error (tail):\n" + last_err[-1200:]
+    await update.message.reply_text(msg)
+
+async def cmd_ios_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    text = await mobile_mcp_service.ios_list_devices()
+    await update.message.reply_text(text)
+
+
+async def cmd_ios_boot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: `/ios_boot <name|udid>`", parse_mode="Markdown")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    device = " ".join(context.args)
+    text = await mobile_mcp_service.ios_boot(device)
+    await update.message.reply_text(text)
+
+
+async def cmd_ios_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    text = await mobile_mcp_service.ios_open_simulator_app()
+    await update.message.reply_text(text)
+
+async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Quick local diagnostics: where bot runs + availability of required binaries.
+    """
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    def which(bin_name: str) -> str:
+        p = shutil.which(bin_name)
+        return p or "NOT FOUND"
+
+    emulator_cfg = os.getenv("ANDROID_EMULATOR_BIN", "emulator")
+    emulator_detected = which(emulator_cfg)
+    sdk_root = os.getenv("ANDROID_SDK_ROOT") or os.getenv("ANDROID_HOME") or ""
+    hint = ""
+    if emulator_detected != "NOT FOUND" and "/Android/sdk/tools/emulator" in emulator_detected:
+        hint = (
+            "\n\nHint: you are using deprecated SDK Tools emulator.\n"
+            "Prefer the modern emulator binary:\n"
+            "  ~/Library/Android/sdk/emulator/emulator\n"
+            "Set ANDROID_EMULATOR_BIN to that full path."
+        )
+
+    # IMPORTANT: send as plain text (no Markdown), underscores/backticks can break Telegram entities.
+    lines = [
+        "🧪 Diagnostics",
+        "",
+        f"OS: {platform.platform()}",
+        f"Python: {platform.python_version()}",
+        "",
+        f"ANDROID_EMULATOR_BIN: {emulator_cfg}",
+        f"emulator (detected): {emulator_detected}",
+        f"ANDROID_SDK_ROOT/ANDROID_HOME: {sdk_root or '-'}",
+        "",
+        f"node: {which('node')}",
+        f"npx: {which('npx')}",
+        f"xcrun: {which('xcrun')}",
+        "",
+        f"MOBILE_MCP_COMMAND: {MOBILE_MCP_COMMAND}",
+    ]
+    await update.message.reply_text("\n".join(lines) + hint)
 
 
 # === PIPELINE COMMAND ===
@@ -1656,6 +2134,26 @@ def main():
     app.add_handler(CommandHandler("mcp_call", cmd_mcp_call))
     app.add_handler(CommandHandler("mcp_status", cmd_mcp_status))
     app.add_handler(CommandHandler("set_reminder", cmd_set_reminder))
+    # Mobile MCP команды
+    app.add_handler(CommandHandler("mobile_start", cmd_mobile_start))
+    app.add_handler(CommandHandler("mobile_stop", cmd_mobile_stop))
+    app.add_handler(CommandHandler("mobile_status", cmd_mobile_status))
+    app.add_handler(CommandHandler("mobile_tools", cmd_mobile_tools))
+    app.add_handler(CommandHandler("mobile_tool", cmd_mobile_tool))
+    app.add_handler(CommandHandler("mobile_devices", cmd_mobile_devices))
+    app.add_handler(CommandHandler("mobile_use", cmd_mobile_use))
+    app.add_handler(CommandHandler("mobile_call", cmd_mobile_call))
+    app.add_handler(CommandHandler("tap", cmd_tap))
+    app.add_handler(CommandHandler("screenshot", cmd_screenshot))
+    # Emulator команды
+    app.add_handler(CommandHandler("android_avds", cmd_android_avds))
+    app.add_handler(CommandHandler("android_boot", cmd_android_boot))
+    app.add_handler(CommandHandler("android_status", cmd_android_status))
+    app.add_handler(CommandHandler("android_stop", cmd_android_stop))
+    app.add_handler(CommandHandler("ios_devices", cmd_ios_devices))
+    app.add_handler(CommandHandler("ios_boot", cmd_ios_boot))
+    app.add_handler(CommandHandler("ios_open", cmd_ios_open))
+    app.add_handler(CommandHandler("diag", cmd_diag))
     # Pipeline команды (MCP chaining: KudaGo → Calendar)
     app.add_handler(CommandHandler("pipeline", cmd_pipeline))
     app.add_handler(CommandHandler("pipeline_add", cmd_pipeline_add))
