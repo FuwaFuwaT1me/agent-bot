@@ -1,7 +1,11 @@
 .env
 new-env/
-/mcp-server-kotlin/build/
+mcp-server-kotlin/build/
+mcp-server-kotlin/bin/
+mcp-server-kotlin/gradle/
 summaries/
 .DS_Store
 __pycache__/
 /mcp-server-kotlin/.gradle/
+doc_index/
+kb/

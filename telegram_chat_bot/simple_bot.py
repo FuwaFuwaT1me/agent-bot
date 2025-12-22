@@ -49,6 +49,247 @@ DAILY_REMINDER_MINUTE = int(os.getenv("DAILY_REMINDER_MINUTE", "0"))  # Default:
 DAILY_REMINDER_CHAT_ID = os.getenv("DAILY_REMINDER_CHAT_ID")  # Your Telegram chat ID
 DAILY_REMINDER_TIMEZONE_OFFSET = int(os.getenv("DAILY_REMINDER_TIMEZONE_OFFSET", "3"))  # Default: Moscow (UTC+3)
 
+# === RAG / KB (single local document) ===
+# Source text file you edit:
+#   kb/knowledge_base.txt
+# Index is created by tools/build_doc_index.py into SQLite:
+#   doc_index/knowledge_base.sqlite
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+KB_SOURCE_PATH = os.getenv("KB_SOURCE_PATH", os.path.join(REPO_ROOT, "kb", "knowledge_base.txt"))
+KB_INDEX_PATH = os.getenv("KB_INDEX_PATH", os.path.join(REPO_ROOT, "doc_index", "knowledge_base.sqlite"))
+KB_TOP_K = int(os.getenv("KB_TOP_K", "5"))
+KB_MAX_CONTEXT_CHARS = int(os.getenv("KB_MAX_CONTEXT_CHARS", "6000"))
+
+# Per-user toggle: whether to inject KB context into regular chat messages.
+user_kb_enabled: Dict[int, bool] = {}
+
+# In-memory cache of KB index for fast retrieval.
+_kb_cache: Dict[str, Any] = {"path": None, "mtime": None, "meta": None, "chunks": None, "emb": None, "model": None}
+_kb_st_model = None  # SentenceTransformer
+
+
+@dataclass(frozen=True)
+class KbChunk:
+    id: str
+    source_path: str
+    chunk_index: int
+    text: str
+
+
+def _kb_load_sqlite(index_path: str) -> tuple[dict, List[KbChunk], "np.ndarray"]:
+    import sqlite3
+    import numpy as np
+
+    con = sqlite3.connect(index_path)
+    try:
+        meta_rows = con.execute("SELECT key, value FROM meta").fetchall()
+        meta = {k: json.loads(v) for (k, v) in meta_rows}
+        rows = con.execute(
+            """
+            SELECT c.id, c.source_path, c.chunk_index, c.text, e.dim, e.vector
+            FROM chunks c
+            JOIN embeddings e ON e.id = c.id
+            ORDER BY c.rowid ASC
+            """
+        ).fetchall()
+        chunks: List[KbChunk] = []
+        vectors: List[np.ndarray] = []
+        for (cid, src, cidx, text, dim, blob) in rows:
+            chunks.append(KbChunk(id=cid, source_path=src, chunk_index=int(cidx), text=text))
+            v = np.frombuffer(blob, dtype=np.float32)
+            if int(dim) != v.shape[0]:
+                raise ValueError(f"Bad vector dim for id={cid}: expected {dim}, got {v.shape[0]}")
+            vectors.append(v)
+        emb = np.stack(vectors, axis=0) if vectors else np.zeros((0, int(meta.get("dim", 0))), dtype=np.float32)
+        return meta, chunks, emb.astype(np.float32, copy=False)
+    finally:
+        con.close()
+
+
+def kb_load_index() -> tuple[dict, List[KbChunk], "np.ndarray", str]:
+    import numpy as np
+
+    index_path = os.path.abspath(KB_INDEX_PATH)
+    if not os.path.exists(index_path):
+        raise FileNotFoundError(
+            f"KB index not found: {index_path}. Run /kb_reindex first (it builds from {KB_SOURCE_PATH})."
+        )
+    mtime = os.path.getmtime(index_path)
+    if _kb_cache["path"] == index_path and _kb_cache["mtime"] == mtime:
+        return _kb_cache["meta"], _kb_cache["chunks"], _kb_cache["emb"], _kb_cache["model"]
+
+    meta, chunks, emb = _kb_load_sqlite(index_path)
+    model_name = meta.get("model") or "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    _kb_cache.update({"path": index_path, "mtime": mtime, "meta": meta, "chunks": chunks, "emb": emb, "model": model_name})
+    return meta, chunks, emb, model_name
+
+
+def kb_embed_query(query: str, model_name: str) -> "np.ndarray":
+    import numpy as np
+
+    global _kb_st_model
+    if _kb_st_model is None or getattr(_kb_st_model, "model_card", None) is None:
+        from sentence_transformers import SentenceTransformer
+        _kb_st_model = SentenceTransformer(model_name)
+    v = _kb_st_model.encode([query], normalize_embeddings=True, convert_to_numpy=True)
+    return v.astype(np.float32, copy=False)[0]
+
+
+def kb_topk_cosine(query_vec: "np.ndarray", emb: "np.ndarray", k: int) -> "np.ndarray":
+    import numpy as np
+
+    if emb.shape[0] == 0:
+        return np.array([], dtype=np.int64)
+    scores = emb @ query_vec
+    if k >= scores.shape[0]:
+        return np.argsort(-scores)
+    idx = np.argpartition(-scores, kth=k - 1)[:k]
+    idx = idx[np.argsort(-scores[idx])]
+    return idx
+
+
+def kb_build_context(chunks: List[KbChunk], emb: "np.ndarray", q: "np.ndarray", idxs: "np.ndarray", max_chars: int) -> str:
+    used = 0
+    out: List[str] = []
+    for rank, i in enumerate(idxs.tolist(), 1):
+        c = chunks[i]
+        score = float(emb[i] @ q)
+        block = f"[{rank}] score={score:.4f}\n{c.text}\n"
+        if used + len(block) > max_chars:
+            break
+        out.append(block)
+        used += len(block)
+    return "\n".join(out).strip()
+
+
+def kb_retrieve(question: str, top_k: int = None) -> tuple[str, dict]:
+    """Returns (context_text, debug_meta)."""
+    top_k = top_k or KB_TOP_K
+    meta, chunks, emb, model_name = kb_load_index()
+    q = kb_embed_query(question, model_name=model_name)
+    idxs = kb_topk_cosine(q, emb, k=top_k)
+    ctx = kb_build_context(chunks, emb, q, idxs, max_chars=KB_MAX_CONTEXT_CHARS)
+    dbg = {"index": os.path.abspath(KB_INDEX_PATH), "model": model_name, "chunks": len(chunks), "top_k": top_k}
+    return ctx, dbg
+
+
+async def cmd_kb_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    enabled = user_kb_enabled.get(user_id, False)
+    src = os.path.abspath(KB_SOURCE_PATH)
+    idx = os.path.abspath(KB_INDEX_PATH)
+    idx_exists = os.path.exists(idx)
+    msg = (
+        "📚 KB (RAG) status\n\n"
+        f"Enabled for chat: {'✅' if enabled else '❌'}\n"
+        f"KB source: {src}\n"
+        f"KB index:  {idx}\n"
+        f"Index exists: {'YES' if idx_exists else 'NO'}\n\n"
+        "Команды:\n"
+        "/kb_reindex — пересобрать индекс\n"
+        "/kb_ask <вопрос> — спросить по базе\n"
+        "/kb_on, /kb_off — включить/выключить подмешивание базы в обычный чат"
+    )
+    await update.message.reply_text(msg)
+
+
+async def cmd_kb_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_kb_enabled[user_id] = True
+    await update.message.reply_text("✅ KB (RAG) включён: буду подмешивать контекст из knowledge_base в обычные ответы.")
+
+
+async def cmd_kb_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_kb_enabled[user_id] = False
+    await update.message.reply_text("❌ KB (RAG) выключен: обычные ответы без базы знаний.")
+
+
+async def cmd_kb_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    src = os.path.abspath(KB_SOURCE_PATH)
+    idx = os.path.abspath(KB_INDEX_PATH)
+    tools_script = os.path.join(REPO_ROOT, "tools", "build_doc_index.py")
+
+    if not os.path.exists(src):
+        await update.message.reply_text(f"❌ KB source not found: {src}")
+        return
+
+    os.makedirs(os.path.dirname(idx), exist_ok=True)
+
+    # Run build_doc_index.py as a subprocess (non-blocking).
+    cmd = [os.environ.get("PYTHON", "python3"), tools_script, "--input", src, "--store", "sqlite", "--out", idx]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=REPO_ROOT,
+    )
+    out_b, err_b = await proc.communicate()
+    out = (out_b or b"").decode("utf-8", errors="replace").strip()
+    err = (err_b or b"").decode("utf-8", errors="replace").strip()
+
+    if proc.returncode != 0:
+        await update.message.reply_text(f"❌ KB reindex failed (code={proc.returncode})\n\n{err or out}")
+        return
+
+    # Invalidate cache so next query reloads updated index.
+    _kb_cache.update({"path": None, "mtime": None, "meta": None, "chunks": None, "emb": None, "model": None})
+    await update.message.reply_text(f"✅ KB index rebuilt.\n\n{out or 'ok'}")
+
+
+async def cmd_kb_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: /kb_ask <вопрос>")
+        return
+
+    question = " ".join(context.args).strip()
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        ctx_text, dbg = kb_retrieve(question)
+    except Exception as e:
+        await update.message.reply_text(f"❌ KB error: {e}\n\nСначала сделай /kb_reindex")
+        return
+
+    if not ctx_text:
+        await update.message.reply_text("ℹ️ В базе знаний не нашёл релевантных фрагментов (контекст пуст).")
+        return
+
+    # Ask chosen model with the retrieved context.
+    model = get_model(update.effective_user.id)
+    system = (
+        "Ты помощник. Отвечай на вопрос, используя ТОЛЬКО контекст из базы знаний ниже. "
+        "Если в контексте нет ответа — скажи, что в базе знаний этого нет."
+    )
+    prompt = f"КОНТЕКСТ (из базы знаний):\n{ctx_text}\n\nВОПРОС:\n{question}"
+
+    try:
+        if model == "deepseek":
+            messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+            completion = hf_client.chat.completions.create(
+                model="deepseek-ai/DeepSeek-V3",
+                messages=messages,
+                temperature=get_temperature(update.effective_user.id),
+                max_tokens=get_max_tokens(update.effective_user.id) or 800,
+            )
+            answer = (completion.choices[0].message.content or "").strip()
+        else:
+            messages = [{"role": "system", "text": system}, {"role": "user", "text": prompt}]
+            result = yandex_sdk.models.completions("yandexgpt").configure(
+                temperature=get_temperature(update.effective_user.id),
+                max_tokens=get_max_tokens(update.effective_user.id) or 800,
+            ).run(messages)
+            answer = ""
+            for alt in result:
+                if hasattr(alt, "text"):
+                    answer = (alt.text or "").strip()
+                    break
+        footer = f"\n\n---\nKB: {dbg['chunks']} chunks | top_k={dbg['top_k']}"
+        await update.message.reply_text((answer or "❌ Пустой ответ модели") + footer)
+    except Exception as e:
+        await update.message.reply_text(f"❌ LLM error: {e}\n\nКонтекст:\n{ctx_text[:1500]}")
+
 # === 1. СОЗДАНИЕ SDK КЛИЕНТОВ ===
 # YandexGPT
 yandex_sdk = YCloudML(folder_id=YANDEX_FOLDER_ID, auth=YANDEX_AUTH)
@@ -470,7 +711,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Города:* Moscow, spb, Kazan, ekb, nnv\n\n"
         "/pipeline\\_cities — все города\n"
         "/pipeline\\_categories — все категории\n"
-        "/pipeline\\_status — статус серверов",
+        "/pipeline\\_status — статус серверов\n\n"
+        "📚 *KB (RAG) — база знаний из kb/knowledge_base.txt*\n"
+        "/kb\\_status — статус базы\n"
+        "/kb\\_reindex — пересобрать индекс\n"
+        "/kb\\_ask <вопрос> — спросить по базе\n"
+        "/kb\\_on — подмешивать базу в обычный чат\n"
+        "/kb\\_off — выключить подмешивание",
         parse_mode="Markdown"
     )
 
@@ -1920,6 +2167,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
     try:
+        # Optional: inject KB context into regular chat if enabled
+        if user_kb_enabled.get(user_id, False):
+            try:
+                ctx_text, _dbg = kb_retrieve(user_message)
+            except Exception:
+                ctx_text = ""
+            if ctx_text:
+                user_message = (
+                    "КОНТЕКСТ (из базы знаний):\n"
+                    f"{ctx_text}\n\n"
+                    "ВОПРОС:\n"
+                    f"{user_message}"
+                )
         # Получаем ответ от агента
         response = ask_agent(user_id, user_message)
         
@@ -2154,6 +2414,12 @@ def main():
     app.add_handler(CommandHandler("ios_boot", cmd_ios_boot))
     app.add_handler(CommandHandler("ios_open", cmd_ios_open))
     app.add_handler(CommandHandler("diag", cmd_diag))
+    # KB / RAG commands
+    app.add_handler(CommandHandler("kb_status", cmd_kb_status))
+    app.add_handler(CommandHandler("kb_reindex", cmd_kb_reindex))
+    app.add_handler(CommandHandler("kb_ask", cmd_kb_ask))
+    app.add_handler(CommandHandler("kb_on", cmd_kb_on))
+    app.add_handler(CommandHandler("kb_off", cmd_kb_off))
     # Pipeline команды (MCP chaining: KudaGo → Calendar)
     app.add_handler(CommandHandler("pipeline", cmd_pipeline))
     app.add_handler(CommandHandler("pipeline_add", cmd_pipeline_add))
