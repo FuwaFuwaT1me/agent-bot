@@ -13,7 +13,7 @@
 
 ```bash
 source new-env/bin/activate
-python -m pip install -r requirements_rag.txt
+python3 -m pip install -r requirements_rag.txt
 ```
 
 ### Сборка индекса
@@ -21,7 +21,7 @@ python -m pip install -r requirements_rag.txt
 Пример: проиндексировать README и код Kotlin:
 
 ```bash
-python tools/build_doc_index.py \
+python3 tools/build_doc_index.py \
   --input README.md \
   --input telegram_chat_bot/README.md \
   --input-dir mcp-server-kotlin/src \
@@ -47,7 +47,7 @@ python tools/build_doc_index.py \
 #### Формат `json` (один файл)
 
 ```bash
-python tools/build_doc_index.py \
+python3 tools/build_doc_index.py \
   --input telegram_chat_bot/README.md \
   --store json \
   --out doc_index/index.json
@@ -56,7 +56,7 @@ python tools/build_doc_index.py \
 #### Формат `sqlite` (один файл)
 
 ```bash
-python tools/build_doc_index.py \
+python3 tools/build_doc_index.py \
   --input telegram_chat_bot/README.md \
   --store sqlite \
   --out doc_index/index.sqlite
@@ -65,7 +65,7 @@ python tools/build_doc_index.py \
 ### Быстрая проверка (поиск)
 
 ```bash
-python tools/search_doc_index.py --index doc_index --query "как работает mcp сервер" --top-k 5
+python3 tools/search_doc_index.py --index doc_index --query "как работает mcp сервер" --top-k 5
 ```
 
 ### Один текстовый файл как “база знаний” для агента
@@ -77,7 +77,7 @@ python tools/search_doc_index.py --index doc_index --query "как работа�
 После этого собери индекс (например, в SQLite):
 
 ```bash
-python tools/build_doc_index.py \
+python3 tools/build_doc_index.py \
   --input kb/knowledge_base.txt \
   --store sqlite \
   --out doc_index/knowledge_base.sqlite
@@ -86,11 +86,35 @@ python tools/build_doc_index.py \
 Дальше можно “спрашивать по базе” (сначала он покажет найденный контекст; если настроен YandexGPT — ещё и ответит):
 
 ```bash
-python tools/rag_ask.py \
+python3 tools/rag_ask.py \
   --index doc_index/knowledge_base.sqlite \
   --question "Что написано про ...?" \
   --top-k 5
 ```
+
+### Агент: сравнение ответа модели с RAG и без RAG
+
+Команда ниже запускает “агента” с двумя режимами и сравнением:
+
+```bash
+python3 rag_agent.py \
+  --index doc_index/knowledge_base.sqlite \
+  --mode compare \
+  --question "Что изменилось в оплате продуктов с 1 марта 2024?"
+```
+
+Что он делает:
+
+- вопрос → поиск релевантных чанков (top-k)
+- сбор контекста
+- запрос к LLM **без RAG** (только вопрос)
+- запрос к LLM **с RAG** (вопрос + найденный контекст)
+- вывод сравнения + (опционально) автоматический вывод “где RAG помог/где нет” через LLM-judge
+
+Переменные окружения для запросов к YandexGPT:
+
+- `YANDEX_FOLDER_ID`
+- `YANDEX_AUTH`
 
 ### Примечания
 

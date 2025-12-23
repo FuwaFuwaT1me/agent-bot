@@ -188,6 +188,7 @@ async def cmd_kb_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/kb_reindex — пересобрать индекс\n"
         "/kb_ask <вопрос> — спросить по базе\n"
+        "/kb_compare <вопрос> — сравнить ответы: без RAG vs с RAG\n"
         "/kb_on, /kb_off — включить/выключить подмешивание базы в обычный чат"
     )
     await update.message.reply_text(msg)
@@ -289,6 +290,215 @@ async def cmd_kb_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text((answer or "❌ Пустой ответ модели") + footer)
     except Exception as e:
         await update.message.reply_text(f"❌ LLM error: {e}\n\nКонтекст:\n{ctx_text[:1500]}")
+
+
+def _llm_one_shot(
+    *,
+    user_id: int,
+    system: str,
+    user_prompt: str,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> tuple[str, int, int]:
+    """
+    One-off LLM call without touching chat history.
+    Returns (text, input_tokens, output_tokens).
+    """
+    model = get_model(user_id)
+    t = get_temperature(user_id) if temperature is None else float(temperature)
+    mt = get_max_tokens(user_id) if max_tokens is None else int(max_tokens)
+    if not mt:
+        mt = 800
+
+    history = [{"role": "system", "text": system}, {"role": "user", "text": user_prompt}]
+    if model == "deepseek":
+        text, in_tok, out_tok = ask_deepseek(history, t, mt)
+    else:
+        text, in_tok, out_tok = ask_yandex(history, t, mt)
+    return (text or "").strip(), int(in_tok or 0), int(out_tok or 0)
+
+
+def _try_compare_judge(
+    *,
+    user_id: int,
+    question: str,
+    rag_context: str,
+    answer_no_rag: str,
+    answer_rag: str,
+) -> Optional[dict]:
+    """
+    Uses the currently selected model to produce a strict JSON comparison.
+    Returns parsed JSON or None.
+    """
+    system = (
+        "Ты строгий reviewer качества ответов LLM. Сравни два ответа на один и тот же вопрос. "
+        "Если дан КОНТЕКСТ — он является источником фактов для оценки. "
+        "Верни СТРОГО валидный JSON без текста вокруг."
+    )
+    user = f"""ВОПРОС:
+{question}
+
+КОНТЕКСТ (RAG):
+{rag_context}
+
+ОТВЕТ A (без RAG):
+{answer_no_rag}
+
+ОТВЕТ B (с RAG):
+{answer_rag}
+
+Верни JSON со схемой:
+{{
+  "winner": "A" | "B" | "tie",
+  "where_rag_helped": [string, ...],
+  "where_rag_not_needed": [string, ...],
+  "where_rag_hurt": [string, ...],
+  "factuality_notes": [string, ...],
+  "confidence": number
+}}
+"""
+    try:
+        judge_text, _in_tok, _out_tok = _llm_one_shot(
+            user_id=user_id,
+            system=system,
+            user_prompt=user,
+            temperature=0.1,
+            max_tokens=900,
+        )
+        if not judge_text:
+            return None
+        return json.loads(judge_text)
+    except Exception:
+        return None
+
+
+async def cmd_kb_compare(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Compare answers with RAG vs without RAG for the same question.
+    Flow: question -> retrieve chunks -> build context -> ask LLM (no-RAG) + ask LLM (RAG) -> conclusion.
+    """
+    if not context.args:
+        await update.message.reply_text("Использование: /kb_compare <вопрос>")
+        return
+
+    user_id = update.effective_user.id
+    question = " ".join(context.args).strip()
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        rag_context, dbg = kb_retrieve(question)
+    except Exception as e:
+        await update.message.reply_text(f"❌ KB error: {e}\n\nСначала сделай /kb_reindex")
+        return
+
+    # Build prompts
+    no_rag_system = (
+        "Ты полезный ассистент. Отвечай по делу, без выдуманных фактов. "
+        "Если информации недостаточно — честно скажи об этом."
+    )
+    rag_system = (
+        "Ты помощник. Отвечай на вопрос, используя ТОЛЬКО контекст из базы знаний ниже. "
+        "Если в контексте нет ответа — скажи, что в базе знаний этого нет."
+    )
+    rag_prompt = f"КОНТЕКСТ (из базы знаний):\n{rag_context}\n\nВОПРОС:\n{question}"
+
+    try:
+        ans_a, a_in, a_out = _llm_one_shot(user_id=user_id, system=no_rag_system, user_prompt=question)
+        ans_b, b_in, b_out = _llm_one_shot(user_id=user_id, system=rag_system, user_prompt=rag_prompt)
+    except Exception as e:
+        await update.message.reply_text(f"❌ LLM error: {e}")
+        return
+
+    judge = _try_compare_judge(
+        user_id=user_id,
+        question=question,
+        rag_context=rag_context,
+        answer_no_rag=ans_a,
+        answer_rag=ans_b,
+    )
+
+    # Render conclusion (prefer judge; fallback to a minimal heuristic)
+    if judge:
+        winner = judge.get("winner", "tie")
+        helped = judge.get("where_rag_helped") or []
+        not_needed = judge.get("where_rag_not_needed") or []
+        hurt = judge.get("where_rag_hurt") or []
+        notes = judge.get("factuality_notes") or []
+        conclusion_lines = [
+            f"Winner: {winner}",
+            f"RAG helped: {len(helped)}",
+            f"RAG not needed: {len(not_needed)}",
+            f"RAG hurt: {len(hurt)}",
+        ]
+        if helped:
+            conclusion_lines.append("Где RAG помог:")
+            conclusion_lines.extend([f"- {x}" for x in helped[:6]])
+        if hurt:
+            conclusion_lines.append("Где RAG навредил/ухудшил:")
+            conclusion_lines.extend([f"- {x}" for x in hurt[:6]])
+        if not_needed:
+            conclusion_lines.append("Где RAG был не нужен:")
+            conclusion_lines.extend([f"- {x}" for x in not_needed[:4]])
+        if notes:
+            conclusion_lines.append("Заметки по фактам:")
+            conclusion_lines.extend([f"- {x}" for x in notes[:6]])
+        conclusion = "\n".join(conclusion_lines).strip()
+    else:
+        conclusion = (
+            "Judge недоступен/вернул не-JSON, поэтому авто-вывод ограничен.\n"
+            "Рекомендация: если ответ с RAG опирается на конкретные факты из контекста и меньше «галлюцинирует» — RAG помог."
+        )
+
+    def _truncate(s: str, limit: int) -> str:
+        s = (s or "").strip()
+        if len(s) <= limit:
+            return s
+        return s[: max(0, limit - 20)].rstrip() + "\n…(truncated)…"
+
+    # Keep output compact for Telegram
+    ctx_hint = "(контекст пуст)" if not rag_context else f"(контекст: {len(rag_context)} chars)"
+    footer = (
+        f"\n\n---\n"
+        f"KB: {dbg['chunks']} chunks | top_k={dbg['top_k']} {ctx_hint}\n"
+        f"A tokens: in={a_in} out={a_out} | B tokens: in={b_in} out={b_out}"
+    )
+
+    # Telegram message limit is ~4096 chars; split if needed.
+    ans_a_short = _truncate(ans_a or "∅", 2500)
+    ans_b_short = _truncate(ans_b or "∅", 2500)
+    conclusion_short = _truncate(conclusion, 1600)
+
+    msg = (
+        "🧪 KB compare (без RAG vs с RAG)\n\n"
+        f"Вопрос:\n{question}\n\n"
+        "A) Ответ без RAG:\n"
+        f"{ans_a_short}\n\n"
+        "B) Ответ с RAG:\n"
+        f"{ans_b_short}\n\n"
+        "Вывод:\n"
+        f"{conclusion_short}"
+        f"{footer}"
+    )
+    if len(msg) <= 3800:
+        await update.message.reply_text(msg)
+        return
+
+    # Fallback: send in 3 messages.
+    await update.message.reply_text(
+        "🧪 KB compare (без RAG vs с RAG)\n\n"
+        f"Вопрос:\n{question}\n\n"
+        "A) Ответ без RAG:\n"
+        f"{ans_a_short}"
+    )
+    await update.message.reply_text(
+        "B) Ответ с RAG:\n"
+        f"{ans_b_short}"
+    )
+    await update.message.reply_text(
+        "Вывод:\n"
+        f"{conclusion_short}"
+        f"{footer}"
+    )
 
 # === 1. СОЗДАНИЕ SDK КЛИЕНТОВ ===
 # YandexGPT
@@ -716,6 +926,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/kb\\_status — статус базы\n"
         "/kb\\_reindex — пересобрать индекс\n"
         "/kb\\_ask <вопрос> — спросить по базе\n"
+        "/kb\\_compare <вопрос> — сравнить ответы: без RAG vs с RAG\n"
         "/kb\\_on — подмешивать базу в обычный чат\n"
         "/kb\\_off — выключить подмешивание",
         parse_mode="Markdown"
@@ -2418,6 +2629,7 @@ def main():
     app.add_handler(CommandHandler("kb_status", cmd_kb_status))
     app.add_handler(CommandHandler("kb_reindex", cmd_kb_reindex))
     app.add_handler(CommandHandler("kb_ask", cmd_kb_ask))
+    app.add_handler(CommandHandler("kb_compare", cmd_kb_compare))
     app.add_handler(CommandHandler("kb_on", cmd_kb_on))
     app.add_handler(CommandHandler("kb_off", cmd_kb_off))
     # Pipeline команды (MCP chaining: KudaGo → Calendar)

@@ -40,6 +40,13 @@ source new-env/bin/activate
 python3 telegram_chat_bot/simple_bot.py
 ```
 
+## KB (RAG) commands
+
+- `/kb_reindex` — build/update index from `kb/knowledge_base.txt`
+- `/kb_on` / `/kb_off` — enable/disable KB context injection in regular chat
+- `/kb_ask <question>` — answer using **only** KB context
+- `/kb_compare <question>` — **compare** answers **without RAG vs with RAG** (+ auto-conclusion)
+
 ## Telegram commands (Mobile MCP)
 
 - `/mobile_start` — start Mobile MCP (`MOBILE_MCP_COMMAND`)
