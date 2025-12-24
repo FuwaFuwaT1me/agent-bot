@@ -59,9 +59,11 @@ KB_SOURCE_PATH = os.getenv("KB_SOURCE_PATH", os.path.join(REPO_ROOT, "kb", "know
 KB_INDEX_PATH = os.getenv("KB_INDEX_PATH", os.path.join(REPO_ROOT, "doc_index", "knowledge_base.sqlite"))
 KB_TOP_K = int(os.getenv("KB_TOP_K", "5"))
 KB_MAX_CONTEXT_CHARS = int(os.getenv("KB_MAX_CONTEXT_CHARS", "6000"))
+KB_MIN_SCORE_DEFAULT = float(os.getenv("KB_MIN_SCORE", "0.0"))
 
 # Per-user toggle: whether to inject KB context into regular chat messages.
 user_kb_enabled: Dict[int, bool] = {}
+user_kb_min_score: Dict[int, float] = {}  # per-user threshold for cosine similarity (0..1)
 
 # In-memory cache of KB index for fast retrieval.
 _kb_cache: Dict[str, Any] = {"path": None, "mtime": None, "meta": None, "chunks": None, "emb": None, "model": None}
@@ -162,26 +164,62 @@ def kb_build_context(chunks: List[KbChunk], emb: "np.ndarray", q: "np.ndarray", 
     return "\n".join(out).strip()
 
 
-def kb_retrieve(question: str, top_k: int = None) -> tuple[str, dict]:
-    """Returns (context_text, debug_meta)."""
+def kb_retrieve(
+    question: str,
+    top_k: int = None,
+    min_score: Optional[float] = None,
+    allow_fallback: bool = True,
+) -> tuple[str, dict]:
+    """Returns (context_text, debug_meta). Applies optional min_score threshold."""
     top_k = top_k or KB_TOP_K
+    if min_score is None:
+        min_score = KB_MIN_SCORE_DEFAULT
     meta, chunks, emb, model_name = kb_load_index()
     q = kb_embed_query(question, model_name=model_name)
     idxs = kb_topk_cosine(q, emb, k=top_k)
-    ctx = kb_build_context(chunks, emb, q, idxs, max_chars=KB_MAX_CONTEXT_CHARS)
-    dbg = {"index": os.path.abspath(KB_INDEX_PATH), "model": model_name, "chunks": len(chunks), "top_k": top_k}
+    scores = [(int(i), float(emb[int(i)] @ q)) for i in idxs.tolist()]
+    kept = [(i, s) for (i, s) in scores if s >= float(min_score)]
+
+    # Fallback: if threshold too strict, keep best-1 (so RAG doesn't become empty unless retrieval is empty).
+    fallback_used = False
+    if allow_fallback and (not kept) and scores:
+        kept = [scores[0]]
+        fallback_used = True
+
+    kept_idxs = [i for (i, _s) in kept]
+    import numpy as np
+    kept_np = np.asarray(kept_idxs, dtype=np.int64) if kept_idxs else np.array([], dtype=np.int64)
+
+    ctx = kb_build_context(chunks, emb, q, kept_np, max_chars=KB_MAX_CONTEXT_CHARS)
+    best_score = kept[0][1] if kept else (scores[0][1] if scores else None)
+    dbg = {
+        "index": os.path.abspath(KB_INDEX_PATH),
+        "model": model_name,
+        "chunks": len(chunks),
+        "top_k": top_k,
+        "min_score": float(min_score),
+        "kept": len(kept),
+        "retrieved": len(scores),
+        "best_score": best_score,
+        "fallback_used": fallback_used,
+        "top_scores": [round(s, 4) for (_i, s) in scores[: min(5, len(scores))]],
+        "kept_scores": [round(s, 4) for (_i, s) in kept[: min(5, len(kept))]],
+        "context_chars": len(ctx) if ctx else 0,
+    }
     return ctx, dbg
 
 
 async def cmd_kb_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     enabled = user_kb_enabled.get(user_id, False)
+    min_score = user_kb_min_score.get(user_id, KB_MIN_SCORE_DEFAULT)
     src = os.path.abspath(KB_SOURCE_PATH)
     idx = os.path.abspath(KB_INDEX_PATH)
     idx_exists = os.path.exists(idx)
     msg = (
         "📚 KB (RAG) status\n\n"
         f"Enabled for chat: {'✅' if enabled else '❌'}\n"
+        f"Min score (threshold): {min_score:.3f}\n"
         f"KB source: {src}\n"
         f"KB index:  {idx}\n"
         f"Index exists: {'YES' if idx_exists else 'NO'}\n\n"
@@ -189,7 +227,66 @@ async def cmd_kb_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/kb_reindex — пересобрать индекс\n"
         "/kb_ask <вопрос> — спросить по базе\n"
         "/kb_compare <вопрос> — сравнить ответы: без RAG vs с RAG\n"
+        "/kb_compare_filter <вопрос> — сравнить RAG: без порога vs с порогом\n"
+        "/kb_threshold [0.0-1.0] — показать/установить порог релевантности\n"
+        "/kb_debug <вопрос> — показать найденные чанки и score (диагностика)\n"
         "/kb_on, /kb_off — включить/выключить подмешивание базы в обычный чат"
+    )
+    await update.message.reply_text(msg)
+
+
+async def cmd_kb_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show or set per-user KB min_score threshold (cosine similarity)."""
+    user_id = update.effective_user.id
+    if not context.args:
+        cur = user_kb_min_score.get(user_id, KB_MIN_SCORE_DEFAULT)
+        await update.message.reply_text(
+            f"📏 KB threshold\n\nCurrent min_score: {cur:.3f}\n\n"
+            "Использование:\n"
+            "/kb_threshold 0.28"
+        )
+        return
+
+    raw = context.args[0].strip().replace(",", ".")
+    try:
+        v = float(raw)
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("out of range")
+    except Exception:
+        await update.message.reply_text("❌ Неверное значение. Укажи число от 0.0 до 1.0, например: /kb_threshold 0.28")
+        return
+
+    user_kb_min_score[user_id] = v
+    await update.message.reply_text(f"✅ KB min_score установлен: {v:.3f}")
+
+
+async def cmd_kb_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show retrieved chunks with scores (for debugging retrieval/threshold)."""
+    if not context.args:
+        await update.message.reply_text("Использование: /kb_debug <вопрос>")
+        return
+
+    question = " ".join(context.args).strip()
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        # Use min_score=0.0 to show raw retrieval distribution.
+        ctx, dbg = kb_retrieve(question, min_score=0.0, allow_fallback=False)
+    except Exception as e:
+        await update.message.reply_text(f"❌ KB error: {e}\n\nСначала сделай /kb_reindex")
+        return
+
+    preview = (ctx or "").strip()
+    if len(preview) > 1600:
+        preview = preview[:1550].rstrip() + "\n…(truncated)…"
+
+    msg = (
+        "🧩 KB debug (retrieval)\n\n"
+        f"Вопрос:\n{question}\n\n"
+        f"top_k={dbg.get('top_k')} retrieved={dbg.get('retrieved')} best={dbg.get('best_score')} ctx_chars={dbg.get('context_chars')}\n"
+        f"top_scores={dbg.get('top_scores')} kept_scores={dbg.get('kept_scores')} fallback_used={dbg.get('fallback_used')}\n\n"
+        "Контекст (превью):\n"
+        f"{preview or '(empty)'}"
     )
     await update.message.reply_text(msg)
 
@@ -248,7 +345,8 @@ async def cmd_kb_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        ctx_text, dbg = kb_retrieve(question)
+        min_score = user_kb_min_score.get(update.effective_user.id, KB_MIN_SCORE_DEFAULT)
+        ctx_text, dbg = kb_retrieve(question, min_score=min_score)
     except Exception as e:
         await update.message.reply_text(f"❌ KB error: {e}\n\nСначала сделай /kb_reindex")
         return
@@ -286,7 +384,12 @@ async def cmd_kb_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if hasattr(alt, "text"):
                     answer = (alt.text or "").strip()
                     break
-        footer = f"\n\n---\nKB: {dbg['chunks']} chunks | top_k={dbg['top_k']}"
+        footer = (
+            "\n\n---\n"
+            f"KB: {dbg['chunks']} chunks | top_k={dbg['top_k']} | min_score={dbg.get('min_score', 0):.3f}\n"
+            f"retrieved={dbg.get('retrieved', 0)} kept={dbg.get('kept', 0)} best={dbg.get('best_score')} ctx_chars={dbg.get('context_chars', 0)}\n"
+            f"top_scores={dbg.get('top_scores')} kept_scores={dbg.get('kept_scores')} fallback_used={dbg.get('fallback_used')}"
+        )
         await update.message.reply_text((answer or "❌ Пустой ответ модели") + footer)
     except Exception as e:
         await update.message.reply_text(f"❌ LLM error: {e}\n\nКонтекст:\n{ctx_text[:1500]}")
@@ -386,7 +489,8 @@ async def cmd_kb_compare(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        rag_context, dbg = kb_retrieve(question)
+        min_score = user_kb_min_score.get(user_id, KB_MIN_SCORE_DEFAULT)
+        rag_context, dbg = kb_retrieve(question, min_score=min_score)
     except Exception as e:
         await update.message.reply_text(f"❌ KB error: {e}\n\nСначала сделай /kb_reindex")
         return
@@ -459,7 +563,9 @@ async def cmd_kb_compare(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ctx_hint = "(контекст пуст)" if not rag_context else f"(контекст: {len(rag_context)} chars)"
     footer = (
         f"\n\n---\n"
-        f"KB: {dbg['chunks']} chunks | top_k={dbg['top_k']} {ctx_hint}\n"
+        f"KB: {dbg['chunks']} chunks | top_k={dbg['top_k']} | min_score={dbg.get('min_score', 0):.3f} {ctx_hint}\n"
+        f"retrieved={dbg.get('retrieved', 0)} kept={dbg.get('kept', 0)} best={dbg.get('best_score')} ctx_chars={dbg.get('context_chars', 0)}\n"
+        f"top_scores={dbg.get('top_scores')} kept_scores={dbg.get('kept_scores')} fallback_used={dbg.get('fallback_used')}\n"
         f"A tokens: in={a_in} out={a_out} | B tokens: in={b_in} out={b_out}"
     )
 
@@ -492,6 +598,180 @@ async def cmd_kb_compare(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(
         "B) Ответ с RAG:\n"
+        f"{ans_b_short}"
+    )
+    await update.message.reply_text(
+        "Вывод:\n"
+        f"{conclusion_short}"
+        f"{footer}"
+    )
+
+
+def _try_ab_judge(
+    *,
+    user_id: int,
+    question: str,
+    context_a: str,
+    answer_a: str,
+    context_b: str,
+    answer_b: str,
+) -> Optional[dict]:
+    """Judge for A/B comparisons where both answers may have different contexts."""
+    system = (
+        "Ты строгий reviewer качества ответов LLM. Сравни два ответа A и B на один и тот же вопрос. "
+        "Для каждого ответа дан свой КОНТЕКСТ — он является источником фактов. "
+        "Верни СТРОГО валидный JSON без текста вокруг."
+    )
+    user = f"""ВОПРОС:
+{question}
+
+КОНТЕКСТ A:
+{context_a}
+
+ОТВЕТ A:
+{answer_a}
+
+КОНТЕКСТ B:
+{context_b}
+
+ОТВЕТ B:
+{answer_b}
+
+Верни JSON со схемой:
+{{
+  "winner": "A" | "B" | "tie",
+  "why": [string, ...],
+  "where_filter_helped": [string, ...],
+  "where_filter_hurt": [string, ...],
+  "confidence": number
+}}
+"""
+    try:
+        judge_text, _in_tok, _out_tok = _llm_one_shot(
+            user_id=user_id,
+            system=system,
+            user_prompt=user,
+            temperature=0.1,
+            max_tokens=900,
+        )
+        if not judge_text:
+            return None
+        return json.loads(judge_text)
+    except Exception:
+        return None
+
+
+async def cmd_kb_compare_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Compare RAG quality without filtering vs with filtering threshold.
+    A: min_score=0.0 (no filter)
+    B: min_score=user threshold (filter)
+    """
+    if not context.args:
+        await update.message.reply_text("Использование: /kb_compare_filter <вопрос>")
+        return
+
+    user_id = update.effective_user.id
+    question = " ".join(context.args).strip()
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    min_score_b = user_kb_min_score.get(user_id, KB_MIN_SCORE_DEFAULT)
+    try:
+        ctx_a, dbg_a = kb_retrieve(question, min_score=0.0, allow_fallback=False)
+        # Strict filtered mode: if nothing passes the threshold, context stays empty.
+        ctx_b, dbg_b = kb_retrieve(question, min_score=min_score_b, allow_fallback=False)
+    except Exception as e:
+        await update.message.reply_text(f"❌ KB error: {e}\n\nСначала сделай /kb_reindex")
+        return
+
+    rag_system = (
+        "Ты помощник. Отвечай на вопрос, используя ТОЛЬКО контекст из базы знаний ниже. "
+        "Если в контексте нет ответа — скажи, что в базе знаний этого нет."
+    )
+    prompt_a = f"КОНТЕКСТ (из базы знаний):\n{ctx_a}\n\nВОПРОС:\n{question}"
+    prompt_b = f"КОНТЕКСТ (из базы знаний):\n{ctx_b}\n\nВОПРОС:\n{question}"
+
+    try:
+        ans_a, a_in, a_out = _llm_one_shot(user_id=user_id, system=rag_system, user_prompt=prompt_a)
+        ans_b, b_in, b_out = _llm_one_shot(user_id=user_id, system=rag_system, user_prompt=prompt_b)
+    except Exception as e:
+        await update.message.reply_text(f"❌ LLM error: {e}")
+        return
+
+    judge = _try_ab_judge(
+        user_id=user_id,
+        question=question,
+        context_a=ctx_a,
+        answer_a=ans_a,
+        context_b=ctx_b,
+        answer_b=ans_b,
+    )
+
+    def _truncate(s: str, limit: int) -> str:
+        s = (s or "").strip()
+        if len(s) <= limit:
+            return s
+        return s[: max(0, limit - 20)].rstrip() + "\n…(truncated)…"
+
+    if judge:
+        winner = judge.get("winner", "tie")
+        why = judge.get("why") or []
+        helped = judge.get("where_filter_helped") or []
+        hurt = judge.get("where_filter_hurt") or []
+        conclusion_lines = [
+            f"Winner: {winner}",
+        ]
+        if why:
+            conclusion_lines.append("Почему:")
+            conclusion_lines.extend([f"- {x}" for x in why[:6]])
+        if helped:
+            conclusion_lines.append("Где фильтр помог:")
+            conclusion_lines.extend([f"- {x}" for x in helped[:6]])
+        if hurt:
+            conclusion_lines.append("Где фильтр ухудшил:")
+            conclusion_lines.extend([f"- {x}" for x in hurt[:6]])
+        conclusion = "\n".join(conclusion_lines).strip()
+    else:
+        conclusion = (
+            "Judge недоступен/вернул не-JSON, поэтому авто-вывод ограничен.\n"
+            "Ориентир: если в B меньше нерелевантных деталей и больше точных фактов из KB — фильтр помог."
+        )
+
+    footer = (
+        "\n\n---\n"
+        f"A (no filter): min_score=0.000 retrieved={dbg_a.get('retrieved', 0)} kept={dbg_a.get('kept', 0)} best={dbg_a.get('best_score')} ctx_chars={dbg_a.get('context_chars')} top_scores={dbg_a.get('top_scores')} kept_scores={dbg_a.get('kept_scores')}\n"
+        f"B (filtered): min_score={dbg_b.get('min_score', 0):.3f} retrieved={dbg_b.get('retrieved', 0)} kept={dbg_b.get('kept', 0)} best={dbg_b.get('best_score')} ctx_chars={dbg_b.get('context_chars')} top_scores={dbg_b.get('top_scores')} kept_scores={dbg_b.get('kept_scores')}\n"
+        f"A tokens: in={a_in} out={a_out} | B tokens: in={b_in} out={b_out}"
+    )
+
+    ans_a_short = _truncate(ans_a or "∅", 2200)
+    ans_b_short = _truncate(ans_b or "∅", 2200)
+    conclusion_short = _truncate(conclusion, 1500)
+
+    msg = (
+        "🧪 KB compare filter (RAG без порога vs с порогом)\n\n"
+        f"Вопрос:\n{question}\n\n"
+        "A) RAG без порога (min_score=0.0):\n"
+        f"{ans_a_short}\n\n"
+        f"B) RAG с порогом (min_score={min_score_b:.3f}):\n"
+        f"{ans_b_short}\n\n"
+        "Вывод:\n"
+        f"{conclusion_short}"
+        f"{footer}"
+    )
+    if len(msg) <= 3800:
+        await update.message.reply_text(msg)
+        return
+
+    # Fallback: split into multiple messages.
+    await update.message.reply_text(
+        "🧪 KB compare filter (RAG без порога vs с порогом)\n\n"
+        f"Вопрос:\n{question}\n\n"
+        "A) RAG без порога (min_score=0.0):\n"
+        f"{ans_a_short}"
+    )
+    await update.message.reply_text(
+        f"B) RAG с порогом (min_score={min_score_b:.3f}):\n"
         f"{ans_b_short}"
     )
     await update.message.reply_text(
@@ -927,6 +1207,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/kb\\_reindex — пересобрать индекс\n"
         "/kb\\_ask <вопрос> — спросить по базе\n"
         "/kb\\_compare <вопрос> — сравнить ответы: без RAG vs с RAG\n"
+        "/kb\\_compare\\_filter <вопрос> — сравнить RAG: без порога vs с порогом\n"
+        "/kb\\_threshold [0.0-1.0] — показать/установить порог релевантности\n"
+        "/kb\\_debug <вопрос> — показать найденные чанки и score\n"
         "/kb\\_on — подмешивать базу в обычный чат\n"
         "/kb\\_off — выключить подмешивание",
         parse_mode="Markdown"
@@ -2381,7 +2664,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Optional: inject KB context into regular chat if enabled
         if user_kb_enabled.get(user_id, False):
             try:
-                ctx_text, _dbg = kb_retrieve(user_message)
+                min_score = user_kb_min_score.get(user_id, KB_MIN_SCORE_DEFAULT)
+                ctx_text, _dbg = kb_retrieve(user_message, min_score=min_score)
             except Exception:
                 ctx_text = ""
             if ctx_text:
@@ -2630,6 +2914,9 @@ def main():
     app.add_handler(CommandHandler("kb_reindex", cmd_kb_reindex))
     app.add_handler(CommandHandler("kb_ask", cmd_kb_ask))
     app.add_handler(CommandHandler("kb_compare", cmd_kb_compare))
+    app.add_handler(CommandHandler("kb_compare_filter", cmd_kb_compare_filter))
+    app.add_handler(CommandHandler("kb_threshold", cmd_kb_threshold))
+    app.add_handler(CommandHandler("kb_debug", cmd_kb_debug))
     app.add_handler(CommandHandler("kb_on", cmd_kb_on))
     app.add_handler(CommandHandler("kb_off", cmd_kb_off))
     # Pipeline команды (MCP chaining: KudaGo → Calendar)
