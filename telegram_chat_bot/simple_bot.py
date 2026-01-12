@@ -65,6 +65,20 @@ KB_MIN_SCORE_DEFAULT = float(os.getenv("KB_MIN_SCORE", "0.0"))
 user_kb_enabled: Dict[int, bool] = {}
 user_kb_min_score: Dict[int, float] = {}  # per-user threshold for cosine similarity (0..1)
 
+# Smart RAG routing: agent decides automatically whether to use RAG
+user_kb_auto_enabled: Dict[int, bool] = {}  # auto-routing mode (default: False)
+
+# Description of knowledge base for the router (what topics it contains)
+KB_DESCRIPTION = """База знаний содержит информацию о:
+- Продукты компании: AlphaCRM (тарифы, функции), BetaAnalytics (тарифы, экспорт)
+- Политика подписок и оплаты (ежемесячная подписка с 1 марта 2024)
+- Контакты офиса: адрес в Москве, часы работы, телефон, email поддержки
+- Доставка: сроки курьером, самовывоз, доставка в регионы
+- Возвраты: условия, сроки, формат номера заказа
+- Внутренние проекты: ALPHA, BetaPay
+- Промокоды и акции
+"""
+
 # In-memory cache of KB index for fast retrieval.
 _kb_cache: Dict[str, Any] = {"path": None, "mtime": None, "meta": None, "chunks": None, "emb": None, "model": None}
 _kb_st_model = None  # SentenceTransformer
@@ -212,25 +226,37 @@ def kb_retrieve(
 async def cmd_kb_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     enabled = user_kb_enabled.get(user_id, False)
+    auto_enabled = user_kb_auto_enabled.get(user_id, False)
     min_score = user_kb_min_score.get(user_id, KB_MIN_SCORE_DEFAULT)
     src = os.path.abspath(KB_SOURCE_PATH)
     idx = os.path.abspath(KB_INDEX_PATH)
     idx_exists = os.path.exists(idx)
+    
+    # Определяем текущий режим
+    if auto_enabled:
+        mode = "🧭 Умный (агент решает сам)"
+    elif enabled:
+        mode = "✅ Принудительный (всегда RAG)"
+    else:
+        mode = "❌ Выключен"
+    
     msg = (
         "📚 KB (RAG) status\n\n"
-        f"Enabled for chat: {'✅' if enabled else '❌'}\n"
+        f"Режим: {mode}\n"
         f"Min score (threshold): {min_score:.3f}\n"
         f"KB source: {src}\n"
         f"KB index:  {idx}\n"
         f"Index exists: {'YES' if idx_exists else 'NO'}\n\n"
         "Команды:\n"
+        "/kb_auto_on — 🧭 умный режим (агент решает сам)\n"
+        "/kb_auto_off — выключить умный режим\n"
+        "/kb_on — принудительный RAG (всегда)\n"
+        "/kb_off — выключить RAG\n"
         "/kb_reindex — пересобрать индекс\n"
         "/kb_ask <вопрос> — спросить по базе\n"
         "/kb_compare <вопрос> — сравнить ответы: без RAG vs с RAG\n"
-        "/kb_compare_filter <вопрос> — сравнить RAG: без порога vs с порогом\n"
-        "/kb_threshold [0.0-1.0] — показать/установить порог релевантности\n"
-        "/kb_debug <вопрос> — показать найденные чанки и score (диагностика)\n"
-        "/kb_on, /kb_off — включить/выключить подмешивание базы в обычный чат"
+        "/kb_threshold [0.0-1.0] — порог релевантности\n"
+        "/kb_debug <вопрос> — диагностика retrieval"
     )
     await update.message.reply_text(msg)
 
@@ -300,7 +326,33 @@ async def cmd_kb_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_kb_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_kb_enabled[user_id] = False
+    user_kb_auto_enabled[user_id] = False  # Выключаем и умный режим
     await update.message.reply_text("❌ KB (RAG) выключен: обычные ответы без базы знаний.")
+
+
+async def cmd_kb_auto_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Включить умный режим RAG — агент сам решает, нужна ли база знаний."""
+    user_id = update.effective_user.id
+    user_kb_auto_enabled[user_id] = True
+    user_kb_enabled[user_id] = False  # Выключаем принудительный режим
+    await update.message.reply_text(
+        "🧭 *Умный режим KB включён!*\n\n"
+        "Теперь агент сам решает, обращаться ли к базе знаний:\n"
+        "• Если вопрос о продуктах, ценах, контактах → RAG\n"
+        "• Если вопрос общий или продолжение темы → без RAG\n\n"
+        "В статистике будет видно решение роутера.",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_kb_auto_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выключить умный режим RAG."""
+    user_id = update.effective_user.id
+    user_kb_auto_enabled[user_id] = False
+    await update.message.reply_text(
+        "❌ Умный режим KB выключен.\n\n"
+        "Используй /kb_on для принудительного RAG или /kb_auto_on для умного режима."
+    )
 
 
 async def cmd_kb_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -419,6 +471,64 @@ def _llm_one_shot(
     else:
         text, in_tok, out_tok = ask_yandex(history, t, mt)
     return (text or "").strip(), int(in_tok or 0), int(out_tok or 0)
+
+
+def should_use_rag(user_id: int, question: str, chat_history: List[dict]) -> tuple[bool, str]:
+    """
+    Smart router: determines if RAG (knowledge base) should be used for the question.
+    
+    Returns:
+        (should_use: bool, reason: str)
+    """
+    # Build a compact history summary for context
+    history_summary = ""
+    recent_messages = chat_history[-6:] if len(chat_history) > 6 else chat_history  # Last 3 turns
+    for msg in recent_messages:
+        if msg.get("role") in ("user", "assistant"):
+            text = msg.get("text", "")[:200]  # Truncate long messages
+            history_summary += f"{msg['role']}: {text}\n"
+    
+    router_system = f"""Ты router-агент. Твоя задача — определить, нужно ли обращаться к базе знаний (RAG) для ответа на вопрос пользователя.
+
+{KB_DESCRIPTION}
+
+ПРАВИЛА:
+1. Если вопрос касается тем из базы знаний (продукты, цены, контакты, доставка, возвраты, подписки) — ответь "RAG"
+2. Если вопрос общий, философский, о погоде, новостях, программировании, математике и т.п. — ответь "NO_RAG"
+3. Если вопрос продолжает предыдущую тему из истории диалога и НЕ требует новых фактов из базы — ответь "NO_RAG"  
+4. Если в истории уже был контекст из базы знаний и вопрос уточняющий — ответь "NO_RAG"
+5. При сомнениях — лучше ответь "RAG" (лишний контекст лучше, чем недостающий)
+
+ВАЖНО: Отвечай ТОЛЬКО одним словом: RAG или NO_RAG"""
+
+    router_prompt = f"""История диалога (последние сообщения):
+{history_summary if history_summary else "(пусто)"}
+
+Новый вопрос пользователя: {question}
+
+Нужен ли RAG?"""
+
+    try:
+        response, _, _ = _llm_one_shot(
+            user_id=user_id,
+            system=router_system,
+            user_prompt=router_prompt,
+            temperature=0.1,  # Low temperature for consistent routing
+            max_tokens=10
+        )
+        
+        response_clean = response.strip().upper()
+        
+        if "NO_RAG" in response_clean or "NO RAG" in response_clean:
+            return False, "Роутер решил: RAG не нужен"
+        elif "RAG" in response_clean:
+            return True, "Роутер решил: нужен RAG"
+        else:
+            # Default to RAG if unclear
+            return True, f"Роутер неопределён ({response_clean}), используем RAG"
+    except Exception as e:
+        # On error, default to RAG
+        return True, f"Ошибка роутера ({e}), используем RAG по умолчанию"
 
 
 def _try_compare_judge(
@@ -1009,6 +1119,8 @@ class AgentResponse:
     time_seconds: float
     cost_rub: float  # Примерная стоимость в рублях
     model: str = ""  # Название модели
+    rag_used: bool = False  # Использовался ли RAG (база знаний)
+    history_used: bool = False  # Использовалась ли история диалога
 
 
 # Цены YandexGPT (примерные, руб за 1000 токенов)
@@ -1069,12 +1181,16 @@ def ask_deepseek(history: List[dict], temperature: float, max_tokens: int = 0) -
     return response_text, input_tokens, output_tokens
 
 
-def ask_agent(user_id: int, question: str) -> AgentResponse:
+def ask_agent(user_id: int, question: str, rag_used: bool = False) -> AgentResponse:
     """Отправляет вопрос агенту и получает ответ с метриками."""
     history = get_history(user_id)
     model = get_model(user_id)
     temperature = get_temperature(user_id)
     max_tokens = get_max_tokens(user_id)
+    
+    # Проверяем, использовалась ли история (до добавления нового вопроса)
+    # История считается использованной, если есть сообщения кроме системного промпта
+    history_used = len(history) > 1  # Больше чем только system prompt
     
     # Проверяем и сжимаем историю ПЕРЕД добавлением нового вопроса
     compressed_before = check_and_compress_history(
@@ -1140,7 +1256,9 @@ def ask_agent(user_id: int, question: str) -> AgentResponse:
         message_tokens=message_tokens,
         time_seconds=elapsed_time,
         cost_rub=cost,
-        model=MODELS[model]
+        model=MODELS[model],
+        rag_used=rag_used,
+        history_used=history_used
     )
 
 
@@ -1204,14 +1322,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/pipeline\\_status — статус серверов\n\n"
         "📚 *KB (RAG) — база знаний из kb/knowledge_base.txt*\n"
         "/kb\\_status — статус базы\n"
-        "/kb\\_reindex — пересобрать индекс\n"
+        "/kb\\_auto\\_on — 🧭 умный режим (агент решает сам)\n"
+        "/kb\\_auto\\_off — выключить умный режим\n"
+        "/kb\\_on — принудительный RAG (всегда)\n"
+        "/kb\\_off — выключить RAG\n"
         "/kb\\_ask <вопрос> — спросить по базе\n"
-        "/kb\\_compare <вопрос> — сравнить ответы: без RAG vs с RAG\n"
-        "/kb\\_compare\\_filter <вопрос> — сравнить RAG: без порога vs с порогом\n"
-        "/kb\\_threshold [0.0-1.0] — показать/установить порог релевантности\n"
-        "/kb\\_debug <вопрос> — показать найденные чанки и score\n"
-        "/kb\\_on — подмешивать базу в обычный чат\n"
-        "/kb\\_off — выключить подмешивание",
+        "/kb\\_threshold [0.0-1.0] — порог релевантности",
         parse_mode="Markdown"
     )
 
@@ -2653,6 +2769,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
     user_id = update.effective_user.id
     user_message = update.message.text
+    original_message = user_message  # Сохраняем оригинал для роутера
     
     if not user_message:
         return
@@ -2661,26 +2778,74 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
     try:
-        # Optional: inject KB context into regular chat if enabled
-        if user_kb_enabled.get(user_id, False):
+        rag_used = False
+        router_reason = ""
+        ctx_text = ""
+        
+        # Определяем режим работы RAG
+        kb_auto = user_kb_auto_enabled.get(user_id, False)  # Умный режим
+        kb_always = user_kb_enabled.get(user_id, False)      # Принудительный режим
+        
+        if kb_auto:
+            # УМНЫЙ РЕЖИМ: агент сам решает, нужен ли RAG
+            history = get_history(user_id)
+            should_rag, router_reason = should_use_rag(user_id, original_message, history)
+            
+            if should_rag:
+                try:
+                    min_score = user_kb_min_score.get(user_id, KB_MIN_SCORE_DEFAULT)
+                    ctx_text, _dbg = kb_retrieve(original_message, min_score=min_score)
+                except Exception:
+                    ctx_text = ""
+                if ctx_text:
+                    rag_used = True
+                    user_message = (
+                        "КОНТЕКСТ (из базы знаний):\n"
+                        f"{ctx_text}\n\n"
+                        "ВОПРОС:\n"
+                        f"{original_message}"
+                    )
+        elif kb_always:
+            # ПРИНУДИТЕЛЬНЫЙ РЕЖИМ: всегда используем RAG
+            router_reason = "Принудительный режим (kb_on)"
             try:
                 min_score = user_kb_min_score.get(user_id, KB_MIN_SCORE_DEFAULT)
                 ctx_text, _dbg = kb_retrieve(user_message, min_score=min_score)
             except Exception:
                 ctx_text = ""
             if ctx_text:
+                rag_used = True
                 user_message = (
                     "КОНТЕКСТ (из базы знаний):\n"
                     f"{ctx_text}\n\n"
                     "ВОПРОС:\n"
                     f"{user_message}"
                 )
+        
         # Получаем ответ от агента
-        response = ask_agent(user_id, user_message)
+        response = ask_agent(user_id, user_message, rag_used=rag_used)
+        
+        # Формируем информацию об источниках
+        sources = []
+        if response.rag_used:
+            sources.append("📚 RAG (база знаний)")
+        if response.history_used:
+            sources.append("💬 История диалога")
+        if not sources:
+            sources.append("🆕 Без контекста")
+        
+        sources_text = " | ".join(sources)
+        
+        # Добавляем причину роутера, если был умный режим
+        router_info = ""
+        if kb_auto and router_reason:
+            router_info = f"🧭 {router_reason}\n"
         
         # Формируем сообщение с метриками
         stats = (
             f"\n\n---\n"
+            f"📌 Источники: {sources_text}\n"
+            f"{router_info}"
             f"🤖 {response.model} | ⏱ {response.time_seconds:.2f}s | 💰 {response.cost_rub:.4f}₽\n"
             f"💬 Your message: {response.message_tokens} tokens\n"
             f"📥 Context (history): {response.input_tokens} tokens\n"
@@ -2919,6 +3084,8 @@ def main():
     app.add_handler(CommandHandler("kb_debug", cmd_kb_debug))
     app.add_handler(CommandHandler("kb_on", cmd_kb_on))
     app.add_handler(CommandHandler("kb_off", cmd_kb_off))
+    app.add_handler(CommandHandler("kb_auto_on", cmd_kb_auto_on))
+    app.add_handler(CommandHandler("kb_auto_off", cmd_kb_auto_off))
     # Pipeline команды (MCP chaining: KudaGo → Calendar)
     app.add_handler(CommandHandler("pipeline", cmd_pipeline))
     app.add_handler(CommandHandler("pipeline_add", cmd_pipeline_add))
