@@ -51,15 +51,18 @@ DAILY_REMINDER_TIMEZONE_OFFSET = int(os.getenv("DAILY_REMINDER_TIMEZONE_OFFSET",
 
 # === RAG / KB (single local document) ===
 # Source text file you edit:
-#   kb/knowledge_base.txt
+#   kb/bookechi_docs.md
 # Index is created by tools/build_doc_index.py into SQLite:
-#   doc_index/knowledge_base.sqlite
+#   doc_index/bookechi.sqlite
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-KB_SOURCE_PATH = os.getenv("KB_SOURCE_PATH", os.path.join(REPO_ROOT, "kb", "knowledge_base.txt"))
-KB_INDEX_PATH = os.getenv("KB_INDEX_PATH", os.path.join(REPO_ROOT, "doc_index", "knowledge_base.sqlite"))
+KB_SOURCE_PATH = os.getenv("KB_SOURCE_PATH", os.path.join(REPO_ROOT, "kb", "bookechi_docs.md"))
+KB_INDEX_PATH = os.getenv("KB_INDEX_PATH", os.path.join(REPO_ROOT, "doc_index", "bookechi.sqlite"))
 KB_TOP_K = int(os.getenv("KB_TOP_K", "5"))
 KB_MAX_CONTEXT_CHARS = int(os.getenv("KB_MAX_CONTEXT_CHARS", "6000"))
 KB_MIN_SCORE_DEFAULT = float(os.getenv("KB_MIN_SCORE", "0.0"))
+
+# === Bookechi Git Repository ===
+BOOKECHI_REPO_PATH = os.getenv("BOOKECHI_REPO_PATH", os.path.join(REPO_ROOT, "bookechi_repo"))
 
 # Per-user toggle: whether to inject KB context into regular chat messages.
 user_kb_enabled: Dict[int, bool] = {}
@@ -69,14 +72,17 @@ user_kb_min_score: Dict[int, float] = {}  # per-user threshold for cosine simila
 user_kb_auto_enabled: Dict[int, bool] = {}  # auto-routing mode (default: False)
 
 # Description of knowledge base for the router (what topics it contains)
-KB_DESCRIPTION = """База знаний содержит информацию о:
-- Продукты компании: AlphaCRM (тарифы, функции), BetaAnalytics (тарифы, экспорт)
-- Политика подписок и оплаты (ежемесячная подписка с 1 марта 2024)
-- Контакты офиса: адрес в Москве, часы работы, телефон, email поддержки
-- Доставка: сроки курьером, самовывоз, доставка в регионы
-- Возвраты: условия, сроки, формат номера заказа
-- Внутренние проекты: ALPHA, BetaPay
-- Промокоды и акции
+KB_DESCRIPTION = """База знаний содержит информацию о проекте Bookechi:
+- Обзор проекта: Android-приложение для отслеживания чтения книг
+- Технологический стек: Kotlin, Jetpack Compose, Room, Koin, Navigation Compose
+- Архитектура MVI: BaseViewModel, Actions, State, Model
+- Модели данных: Book, ReadingSession, ReadingStatus, ActivityIntensity
+- UI компоненты: чарты активности (как на GitHub), обложки книг, текстовые поля
+- База данных Room: BookDao, ReadingSessionDao, AppDatabase
+- Dependency Injection: Koin модули, DatabaseModule
+- Навигация: NavigationHost, экраны (BookList, AddBook, BookDetails, Stats, Goals, Settings)
+- Правила стиля кода Kotlin/Compose
+- Исходный код всех классов проекта
 """
 
 # In-memory cache of KB index for fast retrieval.
@@ -353,6 +359,385 @@ async def cmd_kb_auto_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "❌ Умный режим KB выключен.\n\n"
         "Используй /kb_on для принудительного RAG или /kb_auto_on для умного режима."
     )
+
+
+# === Git Integration Functions ===
+def git_get_current_branch(repo_path: str = None) -> str:
+    """Get current git branch name."""
+    repo_path = repo_path or BOOKECHI_REPO_PATH
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        return result.stdout.strip() if result.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def git_get_recent_commits(repo_path: str = None, count: int = 5) -> List[dict]:
+    """Get recent git commits."""
+    repo_path = repo_path or BOOKECHI_REPO_PATH
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "log", f"-{count}", "--pretty=format:%H|%an|%ar|%s"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode != 0:
+            return []
+        commits = []
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split("|", 3)
+            if len(parts) >= 4:
+                commits.append({
+                    "hash": parts[0][:8],
+                    "author": parts[1],
+                    "date": parts[2],
+                    "message": parts[3]
+                })
+        return commits
+    except Exception:
+        return []
+
+
+def git_get_changed_files(repo_path: str = None) -> dict:
+    """Get list of changed files (staged, unstaged, untracked)."""
+    repo_path = repo_path or BOOKECHI_REPO_PATH
+    import subprocess
+    result = {"staged": [], "modified": [], "untracked": []}
+    try:
+        # Staged files
+        proc = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if proc.returncode == 0:
+            result["staged"] = [f for f in proc.stdout.strip().split("\n") if f]
+        
+        # Modified files (not staged)
+        proc = subprocess.run(
+            ["git", "diff", "--name-only"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if proc.returncode == 0:
+            result["modified"] = [f for f in proc.stdout.strip().split("\n") if f]
+        
+        # Untracked files
+        proc = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if proc.returncode == 0:
+            result["untracked"] = [f for f in proc.stdout.strip().split("\n") if f]
+        
+        return result
+    except Exception:
+        return result
+
+
+def git_read_file(file_path: str, repo_path: str = None) -> Optional[str]:
+    """Read file content from the repository."""
+    repo_path = repo_path or BOOKECHI_REPO_PATH
+    full_path = os.path.join(repo_path, file_path)
+    try:
+        if os.path.exists(full_path) and os.path.isfile(full_path):
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+    except Exception:
+        pass
+    return None
+
+
+def git_list_files(directory: str = "", repo_path: str = None, extension: str = None) -> List[str]:
+    """List files in the repository directory."""
+    repo_path = repo_path or BOOKECHI_REPO_PATH
+    target_dir = os.path.join(repo_path, directory) if directory else repo_path
+    files = []
+    try:
+        if os.path.isdir(target_dir):
+            for root, _, filenames in os.walk(target_dir):
+                for filename in filenames:
+                    if extension and not filename.endswith(extension):
+                        continue
+                    rel_path = os.path.relpath(os.path.join(root, filename), repo_path)
+                    files.append(rel_path)
+    except Exception:
+        pass
+    return files[:100]  # Limit to 100 files
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /help command - answers questions about the Bookechi project.
+    Uses RAG for documentation and Git integration for current repo state.
+    """
+    if not context.args:
+        # Show help menu
+        branch = git_get_current_branch()
+        commits = git_get_recent_commits(count=3)
+        
+        commits_text = ""
+        if commits:
+            commits_text = "\n📝 Последние коммиты:\n"
+            for c in commits:
+                commits_text += f"  • `{c['hash']}` {c['message'][:40]}... ({c['date']})\n"
+        
+        help_text = (
+            "📚 *Bookechi Project Assistant*\n\n"
+            f"🌿 Текущая ветка: `{branch}`\n"
+            f"{commits_text}\n"
+            "Я могу помочь с вопросами о проекте Bookechi:\n\n"
+            "*Примеры вопросов:*\n"
+            "• `/help как добавить новую книгу?`\n"
+            "• `/help какая архитектура используется?`\n"
+            "• `/help покажи пример ViewModel`\n"
+            "• `/help какие зависимости в проекте?`\n"
+            "• `/help как работает Room в проекте?`\n"
+            "• `/help покажи структуру модели Book`\n\n"
+            "*Команды Git:*\n"
+            "• `/git_status` — статус репозитория\n"
+            "• `/git_branch` — текущая ветка\n"
+            "• `/git_log` — последние коммиты\n"
+            "• `/git_files [путь]` — файлы в директории\n"
+            "• `/git_show <файл>` — показать содержимое файла\n"
+        )
+        await update.message.reply_text(help_text, parse_mode="Markdown")
+        return
+    
+    question = " ".join(context.args).strip()
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    # Get git context
+    branch = git_get_current_branch()
+    changed = git_get_changed_files()
+    
+    git_context = f"Текущая ветка: {branch}\n"
+    if changed["staged"]:
+        git_context += f"Staged файлы: {', '.join(changed['staged'][:5])}\n"
+    if changed["modified"]:
+        git_context += f"Измененные файлы: {', '.join(changed['modified'][:5])}\n"
+    
+    # Get RAG context
+    try:
+        min_score = user_kb_min_score.get(update.effective_user.id, KB_MIN_SCORE_DEFAULT)
+        rag_context, dbg = kb_retrieve(question, top_k=7, min_score=min_score)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Ошибка базы знаний: {e}\n\n"
+            "Попробуй сначала выполнить `/kb_reindex` для индексации документации."
+        )
+        return
+    
+    if not rag_context:
+        await update.message.reply_text(
+            "ℹ️ Не нашёл релевантной информации в документации проекта.\n\n"
+            "Попробуй переформулировать вопрос или спроси что-то конкретное о:\n"
+            "• Архитектуре MVI\n"
+            "• Моделях данных (Book, ReadingSession)\n"
+            "• UI компонентах\n"
+            "• Room базе данных\n"
+            "• Навигации"
+        )
+        return
+    
+    # Build system prompt for project assistant
+    system = (
+        "Ты ассистент по проекту Bookechi — Android-приложению для отслеживания чтения книг.\n"
+        "Проект написан на Kotlin с использованием Jetpack Compose, архитектуры MVI, Room и Koin.\n\n"
+        "Твоя задача — отвечать на вопросы о проекте, используя предоставленный контекст.\n"
+        "Если вопрос о коде — приводи примеры из контекста.\n"
+        "Если вопрос о правилах стиля — объясняй паттерны, используемые в проекте.\n"
+        "Отвечай на русском языке, структурировано и по делу.\n"
+        "Если в контексте нет информации — честно скажи об этом."
+    )
+    
+    prompt = (
+        f"GIT СТАТУС:\n{git_context}\n\n"
+        f"КОНТЕКСТ ИЗ ДОКУМЕНТАЦИИ И КОДА:\n{rag_context}\n\n"
+        f"ВОПРОС ПОЛЬЗОВАТЕЛЯ:\n{question}"
+    )
+    
+    try:
+        model = get_model(update.effective_user.id)
+        if model == "deepseek":
+            messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+            completion = hf_client.chat.completions.create(
+                model="deepseek-ai/DeepSeek-V3",
+                messages=messages,
+                temperature=0.3,
+                max_tokens=1500,
+            )
+            answer = (completion.choices[0].message.content or "").strip()
+        else:
+            messages = [{"role": "system", "text": system}, {"role": "user", "text": prompt}]
+            result = yandex_sdk.models.completions("yandexgpt").configure(
+                temperature=0.3,
+                max_tokens=1500,
+            ).run(messages)
+            answer = ""
+            for alt in result:
+                if hasattr(alt, "text"):
+                    answer = (alt.text or "").strip()
+                    break
+        
+        footer = (
+            f"\n\n---\n"
+            f"📚 Источники: {dbg.get('kept', 0)} фрагментов | "
+            f"🌿 Ветка: {branch}"
+        )
+        await update.message.reply_text((answer or "❌ Пустой ответ модели") + footer)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка LLM: {e}")
+
+
+async def cmd_git_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show git repository status."""
+    branch = git_get_current_branch()
+    changed = git_get_changed_files()
+    
+    status_lines = [
+        f"🌿 *Ветка:* `{branch}`\n"
+    ]
+    
+    if changed["staged"]:
+        status_lines.append("📦 *Staged:*")
+        for f in changed["staged"][:10]:
+            status_lines.append(f"  • `{f}`")
+    
+    if changed["modified"]:
+        status_lines.append("\n✏️ *Изменённые:*")
+        for f in changed["modified"][:10]:
+            status_lines.append(f"  • `{f}`")
+    
+    if changed["untracked"]:
+        status_lines.append("\n❓ *Untracked:*")
+        for f in changed["untracked"][:10]:
+            status_lines.append(f"  • `{f}`")
+    
+    if not any([changed["staged"], changed["modified"], changed["untracked"]]):
+        status_lines.append("\n✅ Рабочая директория чистая")
+    
+    await update.message.reply_text("\n".join(status_lines), parse_mode="Markdown")
+
+
+async def cmd_git_branch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current git branch."""
+    branch = git_get_current_branch()
+    await update.message.reply_text(f"🌿 Текущая ветка: `{branch}`", parse_mode="Markdown")
+
+
+async def cmd_git_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show recent git commits."""
+    count = 10
+    if context.args:
+        try:
+            count = int(context.args[0])
+            count = min(max(count, 1), 30)
+        except ValueError:
+            pass
+    
+    commits = git_get_recent_commits(count=count)
+    if not commits:
+        await update.message.reply_text("❌ Не удалось получить коммиты")
+        return
+    
+    lines = ["📝 *Последние коммиты:*\n"]
+    for c in commits:
+        lines.append(f"`{c['hash']}` {c['message'][:50]}")
+        lines.append(f"  👤 {c['author']} • {c['date']}\n")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_git_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List files in repository directory."""
+    directory = context.args[0] if context.args else ""
+    extension = None
+    
+    # Check for extension filter
+    if len(context.args) > 1:
+        ext_arg = context.args[1]
+        if ext_arg.startswith("."):
+            extension = ext_arg
+        elif ext_arg.startswith("*."):
+            extension = ext_arg[1:]
+    
+    files = git_list_files(directory=directory, extension=extension)
+    if not files:
+        await update.message.reply_text(f"📁 Директория `{directory or '/'}` пуста или не найдена")
+        return
+    
+    # Group by directory
+    lines = [f"📁 *Файлы в `{directory or '/'}`*:\n"]
+    shown = files[:30]
+    for f in shown:
+        lines.append(f"  • `{f}`")
+    
+    if len(files) > 30:
+        lines.append(f"\n... и ещё {len(files) - 30} файлов")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_git_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show file content from repository."""
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: `/git_show <путь_к_файлу>`\n\n"
+            "Пример: `/git_show app/src/main/java/fuwafuwa/time/bookechi/data/model/Book.kt`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    file_path = " ".join(context.args).strip()
+    content = git_read_file(file_path)
+    
+    if content is None:
+        await update.message.reply_text(f"❌ Файл не найден: `{file_path}`", parse_mode="Markdown")
+        return
+    
+    # Detect language for syntax highlighting
+    ext = os.path.splitext(file_path)[1].lower()
+    lang = {
+        ".kt": "kotlin",
+        ".kts": "kotlin",
+        ".java": "java",
+        ".xml": "xml",
+        ".json": "json",
+        ".md": "markdown",
+        ".py": "python",
+    }.get(ext, "")
+    
+    # Truncate if too long
+    if len(content) > 3500:
+        content = content[:3500] + "\n\n... (файл обрезан, слишком длинный)"
+    
+    msg = f"📄 `{file_path}`\n\n```{lang}\n{content}\n```"
+    
+    try:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception:
+        # Fallback without formatting
+        await update.message.reply_text(f"📄 {file_path}\n\n{content[:3500]}")
 
 
 async def cmd_kb_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3086,6 +3471,14 @@ def main():
     app.add_handler(CommandHandler("kb_off", cmd_kb_off))
     app.add_handler(CommandHandler("kb_auto_on", cmd_kb_auto_on))
     app.add_handler(CommandHandler("kb_auto_off", cmd_kb_auto_off))
+    # Help команда с RAG и Git интеграцией
+    app.add_handler(CommandHandler("help", cmd_help))
+    # Git команды
+    app.add_handler(CommandHandler("git_status", cmd_git_status))
+    app.add_handler(CommandHandler("git_branch", cmd_git_branch))
+    app.add_handler(CommandHandler("git_log", cmd_git_log))
+    app.add_handler(CommandHandler("git_files", cmd_git_files))
+    app.add_handler(CommandHandler("git_show", cmd_git_show))
     # Pipeline команды (MCP chaining: KudaGo → Calendar)
     app.add_handler(CommandHandler("pipeline", cmd_pipeline))
     app.add_handler(CommandHandler("pipeline_add", cmd_pipeline_add))
