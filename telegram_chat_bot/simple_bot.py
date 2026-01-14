@@ -361,6 +361,310 @@ async def cmd_kb_auto_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# === GitHub Code Review Functions ===
+import re
+from urllib.parse import urlparse
+
+def parse_github_url(url: str) -> Optional[dict]:
+    """
+    Parse GitHub URL to extract owner, repo, type (commit/pull), and id.
+    Supports:
+    - https://github.com/owner/repo/commit/sha
+    - https://github.com/owner/repo/pull/123
+    - https://github.com/owner/repo/pull/123/commits/sha
+    """
+    patterns = [
+        # Commit URL
+        r'github\.com/([^/]+)/([^/]+)/commit/([a-f0-9]+)',
+        # PR URL
+        r'github\.com/([^/]+)/([^/]+)/pull/(\d+)(?:/.*)?',
+    ]
+    
+    for i, pattern in enumerate(patterns):
+        match = re.search(pattern, url)
+        if match:
+            groups = match.groups()
+            if i == 0:  # Commit
+                return {
+                    "owner": groups[0],
+                    "repo": groups[1],
+                    "type": "commit",
+                    "id": groups[2]
+                }
+            else:  # PR
+                return {
+                    "owner": groups[0],
+                    "repo": groups[1],
+                    "type": "pull",
+                    "id": groups[2]
+                }
+    return None
+
+
+async def fetch_github_diff(url: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Fetch diff from GitHub URL.
+    Returns (diff_content, error_message).
+    """
+    parsed = parse_github_url(url)
+    if not parsed:
+        return None, "Не удалось распознать URL. Поддерживаются ссылки на коммиты и PR."
+    
+    # Construct diff URL
+    if parsed["type"] == "commit":
+        diff_url = f"https://github.com/{parsed['owner']}/{parsed['repo']}/commit/{parsed['id']}.diff"
+    else:  # pull
+        diff_url = f"https://github.com/{parsed['owner']}/{parsed['repo']}/pull/{parsed['id']}.diff"
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(diff_url, follow_redirects=True)
+            if response.status_code == 200:
+                return response.text, None
+            else:
+                return None, f"GitHub вернул статус {response.status_code}"
+    except Exception as e:
+        return None, f"Ошибка при получении diff: {e}"
+
+
+async def fetch_github_commit_info(url: str) -> tuple[Optional[dict], Optional[str]]:
+    """
+    Fetch commit/PR info from GitHub API.
+    Returns (info_dict, error_message).
+    """
+    parsed = parse_github_url(url)
+    if not parsed:
+        return None, "Не удалось распознать URL"
+    
+    # GitHub API URLs
+    if parsed["type"] == "commit":
+        api_url = f"https://api.github.com/repos/{parsed['owner']}/{parsed['repo']}/commits/{parsed['id']}"
+    else:
+        api_url = f"https://api.github.com/repos/{parsed['owner']}/{parsed['repo']}/pulls/{parsed['id']}"
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            headers = {"Accept": "application/vnd.github.v3+json"}
+            response = await client.get(api_url, headers=headers, follow_redirects=True)
+            if response.status_code == 200:
+                return response.json(), None
+            else:
+                return None, f"GitHub API вернул статус {response.status_code}"
+    except Exception as e:
+        return None, f"Ошибка API: {e}"
+
+
+def extract_changed_files_from_diff(diff: str) -> List[str]:
+    """Extract list of changed files from diff."""
+    files = []
+    for line in diff.split("\n"):
+        if line.startswith("diff --git"):
+            # Extract file path from "diff --git a/path b/path"
+            parts = line.split(" ")
+            if len(parts) >= 4:
+                file_path = parts[2][2:]  # Remove "a/" prefix
+                files.append(file_path)
+    return files
+
+
+def truncate_diff(diff: str, max_chars: int = 8000) -> str:
+    """Truncate diff if too long, keeping file headers."""
+    if len(diff) <= max_chars:
+        return diff
+    
+    lines = diff.split("\n")
+    result = []
+    current_len = 0
+    
+    for line in lines:
+        if current_len + len(line) + 1 > max_chars - 200:
+            result.append("\n... (diff обрезан, слишком длинный) ...")
+            break
+        result.append(line)
+        current_len += len(line) + 1
+    
+    return "\n".join(result)
+
+
+async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /review <github_url> - Analyze commit or PR and provide code review.
+    Uses RAG for project context and GitHub API for diff.
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "📝 *Ревью кода*\n\n"
+            "Использование: `/review <github_url>`\n\n"
+            "Примеры:\n"
+            "• `/review https://github.com/owner/repo/commit/sha`\n"
+            "• `/review https://github.com/owner/repo/pull/123`\n\n"
+            "Бот получит diff, проанализирует изменения с учётом контекста проекта "
+            "и выдаст ревью с замечаниями.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    url = context.args[0].strip()
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    # Parse URL
+    parsed = parse_github_url(url)
+    if not parsed:
+        await update.message.reply_text(
+            "❌ Не удалось распознать URL.\n\n"
+            "Поддерживаются:\n"
+            "• `https://github.com/owner/repo/commit/sha`\n"
+            "• `https://github.com/owner/repo/pull/123`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Send status message
+    status_msg = await update.message.reply_text(
+        f"🔍 Получаю diff для {parsed['type']} `{parsed['id'][:8] if parsed['type'] == 'commit' else '#' + parsed['id']}`...",
+        parse_mode="Markdown"
+    )
+    
+    # Fetch diff
+    diff, error = await fetch_github_diff(url)
+    if error:
+        await status_msg.edit_text(f"❌ {error}")
+        return
+    
+    if not diff or len(diff.strip()) == 0:
+        await status_msg.edit_text("❌ Diff пустой или не найден")
+        return
+    
+    # Extract changed files
+    changed_files = extract_changed_files_from_diff(diff)
+    
+    await status_msg.edit_text(
+        f"📄 Получен diff ({len(diff)} символов, {len(changed_files)} файлов)\n"
+        f"🔎 Ищу контекст в базе знаний..."
+    )
+    
+    # Get RAG context based on changed files and diff content
+    rag_context = ""
+    try:
+        # Build query from file names and first part of diff
+        query_parts = []
+        for f in changed_files[:5]:
+            # Extract class/file name
+            name = os.path.basename(f).replace(".kt", "").replace(".java", "")
+            query_parts.append(name)
+        
+        query = " ".join(query_parts) if query_parts else "Kotlin Android code review"
+        
+        min_score = user_kb_min_score.get(update.effective_user.id, KB_MIN_SCORE_DEFAULT)
+        rag_context, dbg = kb_retrieve(query, top_k=5, min_score=min_score)
+    except Exception as e:
+        rag_context = ""
+    
+    await status_msg.edit_text(
+        f"📄 Diff: {len(diff)} символов, {len(changed_files)} файлов\n"
+        f"📚 Контекст: {len(rag_context)} символов\n"
+        f"🤖 Генерирую ревью..."
+    )
+    
+    # Truncate diff if too long
+    diff_for_review = truncate_diff(diff, max_chars=10000)
+    
+    # Build review prompt
+    system_prompt = """Ты опытный код-ревьюер для Android-проекта на Kotlin с Jetpack Compose.
+
+Твоя задача — проанализировать diff и дать конструктивное ревью:
+
+1. **Общая оценка** — кратко опиши, что делает этот коммит/PR
+2. **Позитивные моменты** — что сделано хорошо
+3. **Замечания и предложения** — конкретные проблемы с указанием файла и строки:
+   - Потенциальные баги
+   - Нарушения архитектуры (MVI pattern)
+   - Проблемы производительности
+   - Нарушения стиля кода
+   - Отсутствие обработки ошибок
+   - Проблемы с именованием
+4. **Рекомендации** — общие советы по улучшению
+
+Отвечай на русском языке. Будь конкретным и конструктивным.
+Если замечаний нет — так и скажи. Не выдумывай проблемы."""
+
+    # Add project context
+    context_info = ""
+    if rag_context:
+        context_info = f"""
+КОНТЕКСТ ПРОЕКТА (из документации и кода):
+{rag_context}
+
+"""
+
+    user_prompt = f"""{context_info}ИЗМЕНЁННЫЕ ФАЙЛЫ:
+{chr(10).join('• ' + f for f in changed_files[:20])}
+
+DIFF:
+```diff
+{diff_for_review}
+```
+
+Проведи ревью этого кода."""
+
+    # Generate review
+    try:
+        model = get_model(update.effective_user.id)
+        if model == "deepseek":
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+            completion = hf_client.chat.completions.create(
+                model="deepseek-ai/DeepSeek-V3",
+                messages=messages,
+                temperature=0.3,
+                max_tokens=2000,
+            )
+            review = (completion.choices[0].message.content or "").strip()
+        else:
+            messages = [
+                {"role": "system", "text": system_prompt},
+                {"role": "user", "text": user_prompt}
+            ]
+            result = yandex_sdk.models.completions("yandexgpt").configure(
+                temperature=0.3,
+                max_tokens=2000,
+            ).run(messages)
+            review = ""
+            for alt in result:
+                if hasattr(alt, "text"):
+                    review = (alt.text or "").strip()
+                    break
+        
+        # Format response
+        header = (
+            f"📝 *Code Review*\n"
+            f"🔗 [{parsed['owner']}/{parsed['repo']}]({url})\n"
+            f"📦 {parsed['type'].upper()}: `{parsed['id'][:8] if parsed['type'] == 'commit' else '#' + parsed['id']}`\n"
+            f"📄 Файлов изменено: {len(changed_files)}\n\n"
+        )
+        
+        # Delete status message and send review
+        await status_msg.delete()
+        
+        # Split long messages
+        full_response = header + review
+        if len(full_response) > 4000:
+            # Send in parts
+            await update.message.reply_text(header, parse_mode="Markdown", disable_web_page_preview=True)
+            
+            # Split review into chunks
+            chunks = [review[i:i+3900] for i in range(0, len(review), 3900)]
+            for chunk in chunks:
+                await update.message.reply_text(chunk)
+        else:
+            await update.message.reply_text(full_response, parse_mode="Markdown", disable_web_page_preview=True)
+        
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка генерации ревью: {e}")
+
+
 # === Git Integration Functions ===
 def git_get_current_branch(repo_path: str = None) -> str:
     """Get current git branch name."""
@@ -3473,6 +3777,8 @@ def main():
     app.add_handler(CommandHandler("kb_auto_off", cmd_kb_auto_off))
     # Help команда с RAG и Git интеграцией
     app.add_handler(CommandHandler("help", cmd_help))
+    # Code Review команда
+    app.add_handler(CommandHandler("review", cmd_review))
     # Git команды
     app.add_handler(CommandHandler("git_status", cmd_git_status))
     app.add_handler(CommandHandler("git_branch", cmd_git_branch))
