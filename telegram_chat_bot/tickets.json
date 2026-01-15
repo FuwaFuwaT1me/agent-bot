@@ -1,0 +1,255 @@
+{
+  "tickets": [
+    {
+      "id": 1,
+      "user_id": 123456789,
+      "user_name": "Иван Петров",
+      "status": "open",
+      "priority": "high",
+      "category": "bug",
+      "subject": "Приложение вылетает при добавлении книги",
+      "description": "При попытке добавить новую книгу с обложкой приложение закрывается. Телефон Samsung Galaxy S21, Android 13.",
+      "created_at": "2026-01-14T10:30:00Z",
+      "updated_at": "2026-01-14T10:30:00Z",
+      "messages": [
+        {
+          "from": "user",
+          "text": "Приложение вылетает каждый раз, когда я пытаюсь выбрать обложку из галереи",
+          "timestamp": "2026-01-14T10:30:00Z"
+        },
+        {
+          "from": "support",
+          "text": "Здравствуйте! Уточните, пожалуйста, выдавали ли вы разрешение на доступ к файлам?",
+          "timestamp": "2026-01-14T11:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "user_id": 987654321,
+      "user_name": "Мария Сидорова",
+      "status": "open",
+      "priority": "medium",
+      "category": "question",
+      "subject": "Как экспортировать данные?",
+      "description": "Хочу перенести свою библиотеку на новый телефон. Есть ли функция экспорта?",
+      "created_at": "2026-01-13T15:20:00Z",
+      "updated_at": "2026-01-13T16:00:00Z",
+      "messages": [
+        {
+          "from": "user",
+          "text": "Купила новый телефон, хочу перенести все книги. Как это сделать?",
+          "timestamp": "2026-01-13T15:20:00Z"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "user_id": 555555555,
+      "user_name": "Алексей Козлов",
+      "status": "closed",
+      "priority": "low",
+      "category": "feature",
+      "subject": "Хочу синхронизацию с облаком",
+      "description": "Было бы здорово иметь синхронизацию через Google Drive или Dropbox",
+      "created_at": "2026-01-10T09:00:00Z",
+      "updated_at": "2026-01-12T14:30:00Z",
+      "messages": [
+        {
+          "from": "user",
+          "text": "Планируете ли добавить облачную синхронизацию?",
+          "timestamp": "2026-01-10T09:00:00Z"
+        },
+        {
+          "from": "support",
+          "text": "Спасибо за предложение! Функция в планах на версию 2.0.",
+          "timestamp": "2026-01-12T14:30:00Z"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "user_id": 111222333,
+      "user_name": "Елена Новикова",
+      "status": "open",
+      "priority": "high",
+      "category": "bug",
+      "subject": "Статистика показывает неправильные данные",
+      "description": "Чарт активности показывает 0 страниц за вчера, хотя я читала 50 страниц",
+      "created_at": "2026-01-15T08:00:00Z",
+      "updated_at": "2026-01-15T08:00:00Z",
+      "messages": [
+        {
+          "from": "user",
+          "text": "Вчера прочитала 50 страниц, но в статистике пусто. Прогресс книги обновился правильно.",
+          "timestamp": "2026-01-15T08:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "user_id": 444555666,
+      "user_name": "Дмитрий Волков",
+      "status": "in_progress",
+      "priority": "medium",
+      "category": "question",
+      "subject": "Не понимаю как работают цели",
+      "description": "Установил цель 30 страниц в день, но не вижу прогресс",
+      "created_at": "2026-01-14T20:00:00Z",
+      "updated_at": "2026-01-15T09:00:00Z",
+      "messages": [
+        {
+          "from": "user",
+          "text": "Как понять, выполнил я цель или нет?",
+          "timestamp": "2026-01-14T20:00:00Z"
+        },
+        {
+          "from": "support",
+          "text": "Прогресс по целям отображается в разделе 'Цели'. Там есть индикатор выполнения.",
+          "timestamp": "2026-01-15T09:00:00Z"
+        },
+        {
+          "from": "user",
+          "text": "А где именно этот раздел? Не могу найти в меню",
+          "timestamp": "2026-01-15T09:30:00Z"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "user_id": 785534105,
+      "user_name": "Иван Карбушев",
+      "status": "open",
+      "priority": "medium",
+      "category": "question",
+      "subject": "как добавить новый модуль",
+      "description": "как добавить новый модуль",
+      "created_at": "2026-01-15T10:06:15.903997Z",
+      "updated_at": "2026-01-15T10:07:02.960087Z",
+      "messages": [
+        {
+          "from": "user",
+          "text": "как добавить новый модуль",
+          "timestamp": "2026-01-15T10:06:15.903997Z"
+        },
+        {
+          "from": "user",
+          "text": "не понимаю, как создать модуль в проекте",
+          "timestamp": "2026-01-15T10:06:24.924261Z"
+        },
+        {
+          "from": "support",
+          "text": "Здравствуйте!\n\nК сожалению, в предоставленных данных нет информации о том, как добавить новый модуль в проект Bookechi. Чтобы мы могли помочь вам более эффективно, пожалуйста, создайте тикет с подробным описанием вашей проблемы.",
+          "timestamp": "2026-01-15T10:06:38.180454Z"
+        },
+        {
+          "from": "user",
+          "text": "какая структура у модулей в проекте?",
+          "timestamp": "2026-01-15T10:06:56.737527Z"
+        },
+        {
+          "from": "support",
+          "text": "Здравствуйте!\n\nК сожалению, в предоставленных данных нет подробной информации о структуре модулей в проекте Bookechi. Чтобы мы могли помочь вам более эффективно, пожалуйста, создайте тикет с дополнительными вопросами или уточнениями.",
+          "timestamp": "2026-01-15T10:07:02.960087Z"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "user_id": 785534105,
+      "user_name": "Иван Карбушев",
+      "status": "open",
+      "priority": "medium",
+      "category": "question",
+      "subject": "как добавить новый модуль в проект?",
+      "description": "как добавить новый модуль в проект?",
+      "created_at": "2026-01-15T10:14:46.282187Z",
+      "updated_at": "2026-01-15T10:17:23.028988Z",
+      "messages": [
+        {
+          "from": "user",
+          "text": "как добавить новый модуль в проект?",
+          "timestamp": "2026-01-15T10:14:46.282187Z"
+        },
+        {
+          "from": "user",
+          "text": "как я могу добавить новый модуль в проект?",
+          "timestamp": "2026-01-15T10:14:57.756728Z"
+        },
+        {
+          "from": "support",
+          "text": "Чтобы добавить новый модуль в проект Bookechi, выполните следующие шаги:\n\n1. Определите функциональность нового модуля и соответствующий пакет в структуре проекта. Например, если вы хотите добавить модуль для управления закладками, вы можете создать пакет в директории `ui/feature/`.\n\n2. Создайте новый пакет, например, `ui/feature/bookmarks`.\n\n3. В новом пакете определите классы модели, состояния и действия, следуя архитектуре MVI. Например:\n```\npackage fuwafuwa.time.bookechi.ui.feature.bookmarks.mvi\n\nimport fuwafuwa.time.bookechi.mvi.impl.BaseViewModel\n\nclass BookmarksViewModel(\n    override val model: BookmarksModel\n) : BaseViewModel<BookmarksAction, BookmarksState>() {\n}\n```\n\n4. Определите интерфейс модели, следуя контракту `Model` из MVI:\n```\npackage fuwafuwa.time.bookechi.mvi.api\n\nimport kotlinx.coroutines.flow.Flow\nimport kotlinx.coroutines.flow.StateFlow\n\ninterface Model<UiState, UiAction, NavEvent>\n    where UiState : State,\n          UiAction : Action,\n          NavEvent : NavigationEvent {\n\n    val state: StateFlow<UiState>\n    val navigationEvent: Flow<NavEvent>\n\n    fun onAction(action: UiAction)\n\n    fun sendNavigationEvent(navEvent: NavEvent)\n\n    fun clean()\n}\n```\n\n5. Зарегистрируйте новый модуль в системе DI (Koin).\n\n6. Добавьте необходимые UI-компоненты и экраны в новый модуль.\n\n7. Интегрируйте новый модуль с остальной частью приложения, настроив навигацию и взаимодействие с другими модулями.",
+          "timestamp": "2026-01-15T10:15:12.292168Z"
+        },
+        {
+          "from": "user",
+          "text": "окей, а какая структура папок должна быть в модуле, чтобы соответствовать стилю проекта?",
+          "timestamp": "2026-01-15T10:15:51.316260Z"
+        },
+        {
+          "from": "support",
+          "text": "Структура папок в новом модуле должна соответствовать общей структуре проекта Bookechi. Например, если вы добавляете модуль для нового экрана, структура может быть следующей:\n\n- ui/feature/new_module/ — содержит экраны и компоненты UI для нового модуля;\n- data/model/ — модели данных, специфичные для нового модуля;\n- data/local/ — Room DAO для работы с базой данных в новом модуле;\n- data/repository/ — репозитории для доступа к данным;\n- mvi/ — базовые классы MVI для управления состоянием и действиями в новом модуле;\n- base/ui/ — общие UI компоненты, которые могут быть использованы в новом модуле.\n\nЭто общая структура, которая может быть адаптирована под конкретные потребности вашего модуля. Главное — придерживаться принципов организации кода, используемых в проекте Bookechi.",
+          "timestamp": "2026-01-15T10:15:59.259486Z"
+        },
+        {
+          "from": "user",
+          "text": "окей, а какая структура папок должна быть в модуле, чтобы соответствовать стилю проекта?",
+          "timestamp": "2026-01-15T10:17:16.221228Z"
+        },
+        {
+          "from": "support",
+          "text": "Структура папок в новом модуле должна соответствовать общей структуре проекта Bookechi. Например, если вы добавляете модуль для нового экрана, структура может быть следующей:\n\n- ui/feature/new_module/\n\nЕсли вы добавляете новый тип данных, структура может быть такой:\n\n- data/model/new_module/",
+          "timestamp": "2026-01-15T10:17:23.028988Z"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "user_id": 785534105,
+      "user_name": "Иван Карбушев",
+      "status": "open",
+      "priority": "medium",
+      "category": "other",
+      "subject": "навигация по экранам",
+      "description": "навигация по экранам",
+      "created_at": "2026-01-15T10:17:55.558538Z",
+      "updated_at": "2026-01-15T10:18:21.769389Z",
+      "messages": [
+        {
+          "from": "user",
+          "text": "навигация по экранам",
+          "timestamp": "2026-01-15T10:17:55.558538Z"
+        },
+        {
+          "from": "user",
+          "text": "как мне правильно добавить навигацию с экрана списка книг на экран деталей книги?",
+          "timestamp": "2026-01-15T10:18:10.344159Z"
+        },
+        {
+          "from": "support",
+          "text": "Для добавления навигации с экрана списка книг на экран деталей книги в приложении Bookechi, вы можете использовать следующий подход:\n\n1. **Определите действие для перехода на экран деталей книги:**\n   ```kotlin\n   sealed class BookListAction {\n       data class NavigateToBookDetails(val bookId: Long) : BookListAction()\n       // Другие действия\n   }\n   ```\n\n2. **В компоненте списка книг добавьте обработчик нажатия на книгу:**\n   ```kotlin\n   @Composable\n   private fun BooksListView(\n       books: List<Book>,\n       onAction: (BookListAction) -> Unit\n   ) {\n       LazyColumn(\n           // Настройки LazyColumn\n       ) {\n           items(books, key = { it.id }) { book ->\n               BookItemListView(\n                   book = book,\n                   onClick = { onAction(BookListAction.NavigateToBookDetails(book.id)) },\n                   // Другие параметры\n               )\n           }\n       }\n   }\n   ```\n\n3. **Настройте навигацию в `NavGraphBuilder`:**\n   ```kotlin\n   fun NavGraphBuilder.bookDetailsNavRoot(\n       navController: NavController\n   ) {\n       composable<BookDetailsScreen> { backStackEntry ->\n           val route = backStackEntry.toRoute<BookDetailsScreen>()\n           val viewModel: BookDetailsViewModel = koinViewModel { parametersOf(route.bookId) }\n           // Инициализация viewModel и другие настройки\n\n           BaseScreen(\n               navController = navController,\n               viewModel = viewModel\n           ) {\n               // Рendering экрана деталей книги\n           }\n       }\n   }\n   ```\n\n4. **Используйте `NavigateToBookDetails` для перехода на экран деталей книги:**\n   ```kotlin\n   data class NavigateToBookDetails(\n       val bookId: Long\n   ) : BaseNavigationEvent.NavigateTo {\n       override val screen: Screen = BookDetailsScreen(bookId)\n   }\n   ```",
+          "timestamp": "2026-01-15T10:18:21.769389Z"
+        }
+      ]
+    }
+  ],
+  "next_id": 9,
+  "categories": [
+    "bug",
+    "question",
+    "feature",
+    "other"
+  ],
+  "priorities": [
+    "low",
+    "medium",
+    "high",
+    "critical"
+  ],
+  "statuses": [
+    "open",
+    "in_progress",
+    "waiting",
+    "closed"
+  ]
+}

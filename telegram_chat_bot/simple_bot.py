@@ -64,6 +64,124 @@ KB_MIN_SCORE_DEFAULT = float(os.getenv("KB_MIN_SCORE", "0.0"))
 # === Bookechi Git Repository ===
 BOOKECHI_REPO_PATH = os.getenv("BOOKECHI_REPO_PATH", os.path.join(REPO_ROOT, "bookechi_repo"))
 
+# === Support Ticket System ===
+TICKETS_FILE = os.path.join(os.path.dirname(__file__), "tickets.json")
+
+# Per-user support mode toggle
+user_support_mode: Dict[int, bool] = {}  # True = support mode enabled
+user_current_ticket: Dict[int, Optional[int]] = {}  # user_id -> ticket_id
+
+def load_tickets() -> dict:
+    """Load tickets from JSON file."""
+    if os.path.exists(TICKETS_FILE):
+        with open(TICKETS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"tickets": [], "next_id": 1, "categories": ["bug", "question", "feature", "other"], 
+            "priorities": ["low", "medium", "high", "critical"], "statuses": ["open", "in_progress", "waiting", "closed"]}
+
+def save_tickets(data: dict) -> None:
+    """Save tickets to JSON file."""
+    with open(TICKETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def get_ticket_by_id(ticket_id: int) -> Optional[dict]:
+    """Get ticket by ID."""
+    data = load_tickets()
+    for ticket in data["tickets"]:
+        if ticket["id"] == ticket_id:
+            return ticket
+    return None
+
+def get_user_tickets(user_id: int) -> List[dict]:
+    """Get all tickets for a user."""
+    data = load_tickets()
+    return [t for t in data["tickets"] if t["user_id"] == user_id]
+
+def get_open_tickets() -> List[dict]:
+    """Get all open tickets."""
+    data = load_tickets()
+    return [t for t in data["tickets"] if t["status"] in ("open", "in_progress", "waiting")]
+
+def create_ticket(user_id: int, user_name: str, subject: str, description: str, category: str = "question") -> dict:
+    """Create a new ticket."""
+    data = load_tickets()
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    ticket = {
+        "id": data["next_id"],
+        "user_id": user_id,
+        "user_name": user_name,
+        "status": "open",
+        "priority": "medium",
+        "category": category,
+        "subject": subject,
+        "description": description,
+        "created_at": now,
+        "updated_at": now,
+        "messages": [
+            {"from": "user", "text": description, "timestamp": now}
+        ]
+    }
+    data["tickets"].append(ticket)
+    data["next_id"] += 1
+    save_tickets(data)
+    return ticket
+
+def add_message_to_ticket(ticket_id: int, from_who: str, text: str) -> bool:
+    """Add message to ticket."""
+    data = load_tickets()
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    for ticket in data["tickets"]:
+        if ticket["id"] == ticket_id:
+            ticket["messages"].append({"from": from_who, "text": text, "timestamp": now})
+            ticket["updated_at"] = now
+            save_tickets(data)
+            return True
+    return False
+
+def update_ticket_status(ticket_id: int, status: str) -> bool:
+    """Update ticket status."""
+    data = load_tickets()
+    for ticket in data["tickets"]:
+        if ticket["id"] == ticket_id:
+            ticket["status"] = status
+            ticket["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            save_tickets(data)
+            return True
+    return False
+
+def format_ticket_summary(ticket: dict) -> str:
+    """Format ticket for display."""
+    status_emoji = {"open": "🔴", "in_progress": "🟡", "waiting": "🟠", "closed": "🟢"}.get(ticket["status"], "⚪")
+    priority_emoji = {"low": "🔵", "medium": "🟡", "high": "🟠", "critical": "🔴"}.get(ticket["priority"], "⚪")
+    return (
+        f"{status_emoji} *Тикет #{ticket['id']}*\n"
+        f"📋 {ticket['subject']}\n"
+        f"👤 {ticket['user_name']}\n"
+        f"📁 {ticket['category']} | {priority_emoji} {ticket['priority']}\n"
+        f"📅 {ticket['created_at'][:10]}"
+    )
+
+def format_ticket_full(ticket: dict) -> str:
+    """Format ticket with messages."""
+    status_emoji = {"open": "🔴", "in_progress": "🟡", "waiting": "🟠", "closed": "🟢"}.get(ticket["status"], "⚪")
+    
+    header = (
+        f"{status_emoji} *Тикет #{ticket['id']}* — {ticket['status']}\n"
+        f"📋 *{ticket['subject']}*\n"
+        f"👤 {ticket['user_name']} (ID: {ticket['user_id']})\n"
+        f"📁 Категория: {ticket['category']} | Приоритет: {ticket['priority']}\n"
+        f"📅 Создан: {ticket['created_at'][:16].replace('T', ' ')}\n"
+        f"─────────────────────\n"
+    )
+    
+    messages_text = ""
+    for msg in ticket["messages"][-10:]:  # Last 10 messages
+        sender = "👤 Пользователь" if msg["from"] == "user" else "🤖 Поддержка"
+        time_str = msg["timestamp"][11:16] if "T" in msg["timestamp"] else ""
+        messages_text += f"{sender} ({time_str}):\n{msg['text']}\n\n"
+    
+    return header + messages_text
+
 # Per-user toggle: whether to inject KB context into regular chat messages.
 user_kb_enabled: Dict[int, bool] = {}
 user_kb_min_score: Dict[int, float] = {}  # per-user threshold for cosine similarity (0..1)
@@ -663,6 +781,356 @@ DIFF:
         
     except Exception as e:
         await status_msg.edit_text(f"❌ Ошибка генерации ревью: {e}")
+
+
+# === Support Mode Commands ===
+
+async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle support mode or show status."""
+    user_id = update.effective_user.id
+    is_enabled = user_support_mode.get(user_id, False)
+    current_ticket_id = user_current_ticket.get(user_id)
+    current_ticket = get_ticket_by_id(current_ticket_id) if current_ticket_id else None
+    
+    ticket_info = ""
+    if current_ticket:
+        ticket_info = f"\n📋 Активный тикет: #{current_ticket['id']} — {current_ticket['subject']}"
+    
+    status = "✅ Включён" if is_enabled else "❌ Выключен"
+    
+    await update.message.reply_text(
+        f"🎧 *Режим поддержки Bookechi*\n\n"
+        f"Статус: {status}{ticket_info}\n\n"
+        f"*Команды:*\n"
+        f"`/support_on` — включить режим поддержки\n"
+        f"`/support_off` — выключить\n"
+        f"`/ticket_new <тема>` — создать тикет\n"
+        f"`/ticket_list` — мои тикеты\n"
+        f"`/ticket_view <id>` — просмотр тикета\n"
+        f"`/ticket_select <id>` — выбрать тикет для контекста\n"
+        f"`/ticket_close <id>` — закрыть тикет\n"
+        f"`/tickets_all` — все открытые тикеты (админ)\n\n"
+        f"В режиме поддержки бот отвечает на вопросы о Bookechi,\n"
+        f"используя FAQ, документацию и контекст вашего тикета.",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_support_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enable support mode."""
+    user_id = update.effective_user.id
+    user_support_mode[user_id] = True
+    
+    # Check if user has open tickets
+    tickets = get_user_tickets(user_id)
+    open_tickets = [t for t in tickets if t["status"] in ("open", "in_progress", "waiting")]
+    
+    ticket_msg = ""
+    if open_tickets:
+        ticket_msg = f"\n\n📋 У вас {len(open_tickets)} открытых тикетов.\nИспользуйте `/ticket_select <id>` чтобы выбрать тикет для контекста."
+    else:
+        ticket_msg = "\n\n💡 Создайте тикет командой `/ticket_new <тема>` для более точной помощи."
+    
+    await update.message.reply_text(
+        f"🎧 *Режим поддержки включён!*\n\n"
+        f"Теперь я буду отвечать на ваши вопросы о приложении Bookechi.\n"
+        f"Используется FAQ, документация и контекст вашего тикета.{ticket_msg}",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_support_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Disable support mode."""
+    user_id = update.effective_user.id
+    user_support_mode[user_id] = False
+    user_current_ticket[user_id] = None
+    
+    await update.message.reply_text("❌ Режим поддержки выключен. Теперь бот работает в обычном режиме.")
+
+
+async def cmd_ticket_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create a new support ticket."""
+    if not context.args:
+        await update.message.reply_text(
+            "📝 *Создание тикета*\n\n"
+            "Использование: `/ticket_new <тема вашего вопроса>`\n\n"
+            "Пример: `/ticket_new Приложение вылетает при добавлении книги`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    user_id = update.effective_user.id
+    user_name = update.effective_user.full_name or f"User {user_id}"
+    subject = " ".join(context.args).strip()
+    
+    # Determine category from subject
+    subject_lower = subject.lower()
+    if any(word in subject_lower for word in ["вылетает", "ошибка", "баг", "не работает", "crash"]):
+        category = "bug"
+    elif any(word in subject_lower for word in ["как", "почему", "где", "?"]):
+        category = "question"
+    elif any(word in subject_lower for word in ["хочу", "добавьте", "предлагаю", "feature"]):
+        category = "feature"
+    else:
+        category = "other"
+    
+    ticket = create_ticket(user_id, user_name, subject, subject, category)
+    user_current_ticket[user_id] = ticket["id"]
+    user_support_mode[user_id] = True
+    
+    await update.message.reply_text(
+        f"✅ *Тикет #{ticket['id']} создан!*\n\n"
+        f"📋 {subject}\n"
+        f"📁 Категория: {category}\n\n"
+        f"Режим поддержки включён автоматически.\n"
+        f"Опишите вашу проблему подробнее, и я постараюсь помочь!",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_ticket_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List user's tickets."""
+    user_id = update.effective_user.id
+    tickets = get_user_tickets(user_id)
+    
+    if not tickets:
+        await update.message.reply_text(
+            "📭 У вас пока нет тикетов.\n\n"
+            "Создайте новый: `/ticket_new <тема>`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    lines = ["📋 *Ваши тикеты:*\n"]
+    for ticket in sorted(tickets, key=lambda t: t["created_at"], reverse=True):
+        lines.append(format_ticket_summary(ticket))
+        lines.append("")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_ticket_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View ticket details."""
+    if not context.args:
+        await update.message.reply_text("Использование: `/ticket_view <id>`", parse_mode="Markdown")
+        return
+    
+    try:
+        ticket_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID тикета должен быть числом")
+        return
+    
+    ticket = get_ticket_by_id(ticket_id)
+    if not ticket:
+        await update.message.reply_text(f"❌ Тикет #{ticket_id} не найден")
+        return
+    
+    # Check access (user can see own tickets, or it's a public demo)
+    user_id = update.effective_user.id
+    if ticket["user_id"] != user_id:
+        # Allow viewing for demo purposes
+        pass
+    
+    await update.message.reply_text(format_ticket_full(ticket), parse_mode="Markdown")
+
+
+async def cmd_ticket_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Select a ticket for context in support mode."""
+    if not context.args:
+        await update.message.reply_text("Использование: `/ticket_select <id>`", parse_mode="Markdown")
+        return
+    
+    try:
+        ticket_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID тикета должен быть числом")
+        return
+    
+    ticket = get_ticket_by_id(ticket_id)
+    if not ticket:
+        await update.message.reply_text(f"❌ Тикет #{ticket_id} не найден")
+        return
+    
+    user_id = update.effective_user.id
+    user_current_ticket[user_id] = ticket_id
+    user_support_mode[user_id] = True
+    
+    await update.message.reply_text(
+        f"✅ Тикет #{ticket_id} выбран для контекста!\n\n"
+        f"📋 {ticket['subject']}\n\n"
+        f"Теперь ваши вопросы будут учитывать историю этого тикета.",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_ticket_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Close a ticket."""
+    if not context.args:
+        await update.message.reply_text("Использование: `/ticket_close <id>`", parse_mode="Markdown")
+        return
+    
+    try:
+        ticket_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID тикета должен быть числом")
+        return
+    
+    ticket = get_ticket_by_id(ticket_id)
+    if not ticket:
+        await update.message.reply_text(f"❌ Тикет #{ticket_id} не найден")
+        return
+    
+    if update_ticket_status(ticket_id, "closed"):
+        user_id = update.effective_user.id
+        if user_current_ticket.get(user_id) == ticket_id:
+            user_current_ticket[user_id] = None
+        
+        await update.message.reply_text(f"🟢 Тикет #{ticket_id} закрыт!")
+    else:
+        await update.message.reply_text("❌ Ошибка при закрытии тикета")
+
+
+async def cmd_tickets_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all open tickets (admin view)."""
+    tickets = get_open_tickets()
+    
+    if not tickets:
+        await update.message.reply_text("✅ Нет открытых тикетов!")
+        return
+    
+    lines = [f"📋 *Открытые тикеты ({len(tickets)}):*\n"]
+    for ticket in sorted(tickets, key=lambda t: t["created_at"], reverse=True):
+        lines.append(format_ticket_summary(ticket))
+        lines.append("")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def handle_support_message(update: Update, user_id: int, message_text: str) -> Optional[str]:
+    """
+    Handle message in support mode. Returns response text or None if not in support mode.
+    Uses RAG (FAQ + docs) and ticket context.
+    """
+    if not user_support_mode.get(user_id, False):
+        return None
+    
+    await update.message.chat.send_action("typing")
+    
+    # Get current ticket context
+    ticket_context = ""
+    current_ticket_id = user_current_ticket.get(user_id)
+    if current_ticket_id:
+        ticket = get_ticket_by_id(current_ticket_id)
+        if ticket:
+            ticket_context = (
+                f"\n\nКОНТЕКСТ ТИКЕТА #{ticket['id']}:\n"
+                f"Тема: {ticket['subject']}\n"
+                f"Категория: {ticket['category']}\n"
+                f"Статус: {ticket['status']}\n"
+                f"История переписки:\n"
+            )
+            for msg in ticket["messages"][-5:]:
+                sender = "Пользователь" if msg["from"] == "user" else "Поддержка"
+                ticket_context += f"- {sender}: {msg['text'][:200]}\n"
+            
+            # Add user message to ticket
+            add_message_to_ticket(current_ticket_id, "user", message_text)
+    
+    # Get RAG context from FAQ and docs
+    # Use more chunks and no min_score filter for support mode
+    rag_context = ""
+    dbg = {}
+    try:
+        rag_context, dbg = kb_retrieve(message_text, top_k=8, min_score=0.0, allow_fallback=True)
+    except Exception as e:
+        rag_context = ""
+        dbg = {"error": str(e)}
+    
+    # Build system prompt for support agent
+    system_prompt = """Ты агент поддержки и эксперт по проекту Bookechi — Android-приложению для отслеживания чтения книг.
+
+Bookechi — это:
+- Android-приложение на Kotlin с Jetpack Compose
+- Архитектура MVI (Model-View-Intent)
+- Room для базы данных, Koin для DI
+- UI с чартами активности (как GitHub contributions)
+
+Структура проекта:
+- ui/feature/ — экраны (book_list, add_book, book_details, reading_stats, settings)
+- data/model/ — модели (Book, ReadingSession, ReadingStatus)
+- data/local/ — Room DAO (BookDao, ReadingSessionDao)
+- data/repository/ — репозитории
+- mvi/ — базовые классы MVI (BaseViewModel, State, Action)
+- base/ui/ — общие UI компоненты (чарты, обложки книг)
+
+Твоя задача:
+1. Отвечай на вопросы о коде и архитектуре проекта
+2. ОБЯЗАТЕЛЬНО используй предоставленный КОНТЕКСТ — там фрагменты кода и документации
+3. Приводи примеры кода из контекста
+4. Если вопрос о пользовательских функциях — используй FAQ
+5. Отвечай структурированно и по делу
+
+Отвечай на русском языке."""
+
+    prompt = f"""КОНТЕКСТ ИЗ FAQ И ДОКУМЕНТАЦИИ:
+{rag_context if rag_context else "(нет релевантного контекста)"}
+{ticket_context}
+
+ВОПРОС ПОЛЬЗОВАТЕЛЯ:
+{message_text}
+
+Дай полезный ответ:"""
+
+    # Generate response
+    try:
+        model = get_model(user_id)
+        if model == "deepseek":
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ]
+            completion = hf_client.chat.completions.create(
+                model="deepseek-ai/DeepSeek-V3",
+                messages=messages,
+                temperature=0.4,
+                max_tokens=1000,
+            )
+            response = (completion.choices[0].message.content or "").strip()
+        else:
+            messages = [
+                {"role": "system", "text": system_prompt},
+                {"role": "user", "text": prompt}
+            ]
+            result = yandex_sdk.models.completions("yandexgpt").configure(
+                temperature=0.4,
+                max_tokens=1000,
+            ).run(messages)
+            response = ""
+            for alt in result:
+                if hasattr(alt, "text"):
+                    response = (alt.text or "").strip()
+                    break
+        
+        # Add response to ticket if exists
+        if current_ticket_id and response:
+            add_message_to_ticket(current_ticket_id, "support", response)
+        
+        # Add footer with debug info
+        footer = "\n\n─────────────────────\n🎧 _Режим поддержки Bookechi_"
+        if current_ticket_id:
+            footer += f" | 📋 _Тикет #{current_ticket_id}_"
+        
+        # Debug: show RAG stats
+        if dbg:
+            chunks = dbg.get('kept', dbg.get('retrieved', 0))
+            best = dbg.get('best_score', 0)
+            footer += f"\n📚 _RAG: {chunks} фрагментов, score={best:.2f}_" if best else ""
+        
+        return response + footer
+    
+    except Exception as e:
+        return f"❌ Ошибка генерации ответа: {e}"
 
 
 # === Git Integration Functions ===
@@ -1962,61 +2430,38 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary_info = f"\n📦 Загружено суммаризаций из памяти: {summary_count}" if summary_count > 0 else ""
     
     await update.message.reply_text(
-        f"👋 Привет! Я простой бот-ассистент.{summary_info}\n\n"
+        f"👋 Привет! Я бот-ассистент проекта *Bookechi*.{summary_info}\n\n"
         "Просто напиши мне вопрос, и я отвечу.\n\n"
-        "⚙️ *Настройки бота:*\n"
-        "/model — выбрать модель (YandexGPT / DeepSeek)\n"
-        "/clear — очистить историю\n"
-        "/clear all — полная очистка с суммаризациями\n"
-        "/set\\_system\\_prompt <текст> — системный промпт\n"
-        "/temperature — текущая температура\n"
-        "/set\\_temperature <0-1> — изменить температуру\n"
-        "/max\\_tokens — лимит токенов\n"
-        "/set\\_max\\_tokens <число> — установить лимит\n"
-        "/compress\\_trigger — настройки сжатия\n"
-        "/set\\_compress\\_trigger <число> — триггер сжатия\n\n"
-        "🔧 *MCP Calendar:*\n"
-        "/mcp\\_status — статус MCP сервера\n"
-        "/mcp\\_tools — список инструментов\n"
-        "/mcp\\_call <tool> [args] — вызвать инструмент\n"
-        "/set\\_reminder — ежедневные напоминания\n\n"
-        "📱 *Mobile MCP (эмулятор / симулятор):*\n"
-        "/mobile\\_start — запустить Mobile MCP (npx)\n"
-        "/mobile\\_status — статус Mobile MCP\n"
-        "/mobile\\_tools — список инструментов Mobile MCP\n"
-        "/mobile\\_devices — список устройств (device ids)\n"
-        "/mobile\\_use <device> — выбрать устройство для вызовов\n"
-        "/mobile\\_call <tool> [json|k=v] — вызвать tool\n"
-        "/tap <x> <y> — тап по координатам (если tool доступен)\n"
-        "/screenshot — скриншот экрана (если tool доступен)\n"
-        "/android\\_avds — список Android AVD\n"
-        "/android\\_boot <avd> [headless] — запуск эмулятора\n"
-        "/android\\_status — статус эмулятора (из бота)\n"
-        "/android\\_stop — остановка эмулятора\n"
-        "/ios\\_devices — список iOS Simulator устройств\n"
-        "/ios\\_boot <name|udid> — boot iOS Simulator\n"
-        "/ios\\_open — открыть приложение Simulator\n\n"
-        "🎫 *Pipeline (KudaGo → Яндекс Календарь):*\n"
-        "Автоматический поиск событий и добавление в календарь!\n\n"
-        "`/pipeline <категория> [город] [от] [до] [лимит]`\n\n"
-        "*Примеры:*\n"
-        "`/pipeline concert` — концерты в Москве\n"
-        "`/pipeline concert Moscow 7` — на 7 дней\n"
-        "`/pipeline theater spb 2025-12-25` — с 25 дек\n"
-        "`/pipeline concert Moscow 2025-12-25 2025-12-31 3`\n\n"
-        "*Категории:* concert, theater, exhibition, festival, party\n"
-        "*Города:* Moscow, spb, Kazan, ekb, nnv\n\n"
-        "/pipeline\\_cities — все города\n"
-        "/pipeline\\_categories — все категории\n"
-        "/pipeline\\_status — статус серверов\n\n"
-        "📚 *KB (RAG) — база знаний из kb/knowledge_base.txt*\n"
+        "📚 *Bookechi — помощь по проекту:*\n"
+        "/help — помощь по проекту (RAG + Git)\n"
+        "/help <вопрос> — спросить о проекте\n"
+        "/review <github\\_url> — ревью коммита/PR\n\n"
+        "🎧 *Поддержка пользователей:*\n"
+        "/support — статус режима поддержки\n"
+        "/support\\_on — включить режим поддержки\n"
+        "/support\\_off — выключить\n"
+        "/ticket\\_new <тема> — создать тикет\n"
+        "/ticket\\_list — мои тикеты\n"
+        "/ticket\\_view <id> — просмотр тикета\n"
+        "/ticket\\_select <id> — выбрать тикет\n"
+        "/ticket\\_close <id> — закрыть тикет\n"
+        "/tickets\\_all — все открытые тикеты\n\n"
+        "🔧 *Git интеграция (MCP):*\n"
+        "/git\\_status — статус репозитория\n"
+        "/git\\_branch — текущая ветка\n"
+        "/git\\_log [N] — последние коммиты\n"
+        "/git\\_files [путь] — файлы в директории\n"
+        "/git\\_show <файл> — содержимое файла\n\n"
+        "📖 *KB (RAG) — база знаний Bookechi:*\n"
         "/kb\\_status — статус базы\n"
-        "/kb\\_auto\\_on — 🧭 умный режим (агент решает сам)\n"
-        "/kb\\_auto\\_off — выключить умный режим\n"
-        "/kb\\_on — принудительный RAG (всегда)\n"
-        "/kb\\_off — выключить RAG\n"
         "/kb\\_ask <вопрос> — спросить по базе\n"
-        "/kb\\_threshold [0.0-1.0] — порог релевантности",
+        "/kb\\_auto\\_on — умный режим RAG\n"
+        "/kb\\_off — выключить RAG\n\n"
+        "⚙️ *Настройки бота:*\n"
+        "/model — выбрать модель\n"
+        "/clear — очистить историю\n"
+        "/temperature — температура генерации\n\n"
+        "_Для полного списка команд используй /commands_",
         parse_mode="Markdown"
     )
 
@@ -3463,6 +3908,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_message:
         return
     
+    # === SUPPORT MODE CHECK ===
+    # If support mode is enabled, handle through support agent
+    if user_support_mode.get(user_id, False):
+        response = await handle_support_message(update, user_id, user_message)
+        if response:
+            await update.message.reply_text(response, parse_mode="Markdown")
+            return
+    
     # Показываем, что бот "печатает"
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
@@ -3779,6 +4232,16 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     # Code Review команда
     app.add_handler(CommandHandler("review", cmd_review))
+    # Support / Ticket команды
+    app.add_handler(CommandHandler("support", cmd_support))
+    app.add_handler(CommandHandler("support_on", cmd_support_on))
+    app.add_handler(CommandHandler("support_off", cmd_support_off))
+    app.add_handler(CommandHandler("ticket_new", cmd_ticket_new))
+    app.add_handler(CommandHandler("ticket_list", cmd_ticket_list))
+    app.add_handler(CommandHandler("ticket_view", cmd_ticket_view))
+    app.add_handler(CommandHandler("ticket_select", cmd_ticket_select))
+    app.add_handler(CommandHandler("ticket_close", cmd_ticket_close))
+    app.add_handler(CommandHandler("tickets_all", cmd_tickets_all))
     # Git команды
     app.add_handler(CommandHandler("git_status", cmd_git_status))
     app.add_handler(CommandHandler("git_branch", cmd_git_branch))

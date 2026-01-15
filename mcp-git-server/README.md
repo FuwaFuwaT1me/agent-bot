@@ -97,3 +97,4 @@ GIT_REPO_PATH=/path/to/repo python3 git_mcp_server.py
 Команда `/help` использует RAG + Git для ответов на вопросы о проекте.
 
 
+
