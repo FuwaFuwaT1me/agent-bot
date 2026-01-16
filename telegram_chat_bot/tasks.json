@@ -1,0 +1,138 @@
+{
+  "tasks": [
+    {
+      "id": 1,
+      "key": "BOOK-1",
+      "title": "Добавить облачную синхронизацию",
+      "description": "Реализовать синхронизацию данных через Google Drive или Dropbox",
+      "type": "feature",
+      "status": "open",
+      "priority": "high",
+      "assignee": null,
+      "labels": ["backend", "sync"],
+      "estimate_hours": 40,
+      "created_at": "2026-01-10T10:00:00Z",
+      "updated_at": "2026-01-10T10:00:00Z",
+      "comments": [
+        {"author": "PM", "text": "Пользователи часто просят эту функцию", "timestamp": "2026-01-10T10:00:00Z"}
+      ]
+    },
+    {
+      "id": 2,
+      "key": "BOOK-2",
+      "title": "Исправить краш при добавлении обложки",
+      "description": "Приложение вылетает при выборе изображения из галереи на некоторых устройствах Samsung",
+      "type": "bug",
+      "status": "in_progress",
+      "priority": "critical",
+      "assignee": "dev1",
+      "labels": ["bug", "crash", "android"],
+      "estimate_hours": 8,
+      "created_at": "2026-01-14T09:00:00Z",
+      "updated_at": "2026-01-15T11:00:00Z",
+      "comments": [
+        {"author": "QA", "text": "Воспроизводится на Samsung Galaxy S21, Android 13", "timestamp": "2026-01-14T09:00:00Z"},
+        {"author": "dev1", "text": "Похоже на проблему с разрешениями, исследую", "timestamp": "2026-01-15T11:00:00Z"}
+      ]
+    },
+    {
+      "id": 3,
+      "key": "BOOK-3",
+      "title": "Оптимизировать загрузку списка книг",
+      "description": "При большом количестве книг (100+) список загружается медленно",
+      "type": "improvement",
+      "status": "open",
+      "priority": "medium",
+      "assignee": null,
+      "labels": ["performance", "ui"],
+      "estimate_hours": 16,
+      "created_at": "2026-01-12T14:00:00Z",
+      "updated_at": "2026-01-12T14:00:00Z",
+      "comments": []
+    },
+    {
+      "id": 4,
+      "key": "BOOK-4",
+      "title": "Добавить экспорт данных в CSV",
+      "description": "Возможность экспортировать список книг и статистику в CSV файл",
+      "type": "feature",
+      "status": "open",
+      "priority": "low",
+      "assignee": null,
+      "labels": ["export", "feature"],
+      "estimate_hours": 12,
+      "created_at": "2026-01-11T16:00:00Z",
+      "updated_at": "2026-01-11T16:00:00Z",
+      "comments": []
+    },
+    {
+      "id": 5,
+      "key": "BOOK-5",
+      "title": "Статистика показывает неверные данные",
+      "description": "Чарт активности не обновляется после добавления сессии чтения",
+      "type": "bug",
+      "status": "open",
+      "priority": "high",
+      "assignee": null,
+      "labels": ["bug", "stats", "ui"],
+      "estimate_hours": 6,
+      "created_at": "2026-01-15T08:00:00Z",
+      "updated_at": "2026-01-15T08:00:00Z",
+      "comments": [
+        {"author": "user", "text": "Вчера прочитала 50 страниц, но в статистике пусто", "timestamp": "2026-01-15T08:00:00Z"}
+      ]
+    },
+    {
+      "id": 6,
+      "key": "BOOK-6",
+      "title": "Добавить тёмную тему",
+      "description": "Поддержка системной тёмной темы и ручного переключения",
+      "type": "feature",
+      "status": "done",
+      "priority": "medium",
+      "assignee": "dev2",
+      "labels": ["ui", "theme"],
+      "estimate_hours": 8,
+      "created_at": "2026-01-05T10:00:00Z",
+      "updated_at": "2026-01-08T15:00:00Z",
+      "comments": [
+        {"author": "dev2", "text": "Реализовано с Dynamic Color на Android 12+", "timestamp": "2026-01-08T15:00:00Z"}
+      ]
+    },
+    {
+      "id": 7,
+      "key": "BOOK-7",
+      "title": "Написать unit-тесты для BookRepository",
+      "description": "Покрыть тестами основные методы репозитория",
+      "type": "task",
+      "status": "open",
+      "priority": "medium",
+      "assignee": null,
+      "labels": ["testing", "backend"],
+      "estimate_hours": 4,
+      "created_at": "2026-01-13T11:00:00Z",
+      "updated_at": "2026-01-13T11:00:00Z",
+      "comments": []
+    },
+    {
+      "id": 8,
+      "key": "BOOK-8",
+      "title": "Добавить поиск по книгам",
+      "description": "Возможность искать книги по названию и автору",
+      "type": "feature",
+      "status": "open",
+      "priority": "high",
+      "assignee": null,
+      "labels": ["ui", "feature", "search"],
+      "estimate_hours": 10,
+      "created_at": "2026-01-14T12:00:00Z",
+      "updated_at": "2026-01-14T12:00:00Z",
+      "comments": []
+    }
+  ],
+  "next_id": 9,
+  "types": ["bug", "feature", "improvement", "task"],
+  "statuses": ["open", "in_progress", "review", "done", "closed"],
+  "priorities": ["critical", "high", "medium", "low"]
+}
+

@@ -783,6 +783,857 @@ DIFF:
         await status_msg.edit_text(f"❌ Ошибка генерации ревью: {e}")
 
 
+# === GitHub Issues Integration ===
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER", "FuwaFuwaT1me")
+GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME", "Bookechi")
+GITHUB_API = "https://api.github.com"
+
+# Fallback to local JSON if no GitHub credentials
+TASKS_FILE = os.path.join(os.path.dirname(__file__), "tasks.json")
+USE_GITHUB_ISSUES = bool(GITHUB_TOKEN)
+
+# Priority labels for GitHub Issues
+PRIORITY_LABELS = {
+    "critical": "priority: critical",
+    "high": "priority: high",
+    "medium": "priority: medium",
+    "low": "priority: low"
+}
+
+# Type labels for GitHub Issues
+TYPE_LABELS = {
+    "bug": "bug",
+    "feature": "enhancement",
+    "improvement": "enhancement",
+    "task": "task"
+}
+
+
+async def github_request(method: str, endpoint: str, data: dict = None) -> tuple[Optional[dict], Optional[str]]:
+    """Make request to GitHub API."""
+    if not USE_GITHUB_ISSUES:
+        return None, "GitHub не настроен. Установите GITHUB_TOKEN."
+    
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    
+    url = f"{GITHUB_API}{endpoint}"
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            if method == "GET":
+                response = await client.get(url, headers=headers)
+            elif method == "POST":
+                response = await client.post(url, headers=headers, json=data)
+            elif method == "PATCH":
+                response = await client.patch(url, headers=headers, json=data)
+            else:
+                return None, f"Неподдерживаемый метод: {method}"
+            
+            if response.status_code in (200, 201):
+                result = response.json()
+                return result, None
+            else:
+                error_text = response.text[:500]
+                return None, f"GitHub API ({response.status_code}): {error_text}"
+    except Exception as e:
+        return None, f"Ошибка запроса: {e}"
+
+
+def normalize_github_issue(issue: dict) -> dict:
+    """Convert GitHub Issue to unified format."""
+    labels = [l.get("name", "") for l in issue.get("labels", [])]
+    
+    # Extract priority from labels
+    priority = "medium"
+    for p, label in PRIORITY_LABELS.items():
+        if label in labels:
+            priority = p
+            break
+    
+    # Extract type from labels
+    task_type = "task"
+    if "bug" in labels:
+        task_type = "bug"
+    elif "enhancement" in labels:
+        task_type = "feature"
+    
+    # Status based on state
+    status = "open" if issue.get("state") == "open" else "done"
+    
+    return {
+        "id": issue.get("id"),
+        "number": issue.get("number"),
+        "key": f"#{issue.get('number', '')}",
+        "title": issue.get("title", ""),
+        "description": issue.get("body", "") or "",
+        "type": task_type,
+        "status": status,
+        "priority": priority,
+        "assignee": issue.get("assignee", {}).get("login") if issue.get("assignee") else None,
+        "labels": labels,
+        "created_at": issue.get("created_at", ""),
+        "updated_at": issue.get("updated_at", ""),
+        "html_url": issue.get("html_url", ""),
+        "comments": []
+    }
+
+
+# === Local JSON fallback functions ===
+def load_tasks_local() -> dict:
+    """Load tasks from local JSON file."""
+    if os.path.exists(TASKS_FILE):
+        with open(TASKS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"tasks": [], "next_id": 1}
+
+def save_tasks_local(data: dict) -> None:
+    """Save tasks to local JSON file."""
+    with open(TASKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# === Unified task functions (use GitHub or local) ===
+async def get_tasks_list(queue: str = None, status: str = None, priority: str = None) -> tuple[List[dict], Optional[str]]:
+    """Get list of tasks from GitHub Issues or local storage."""
+    if USE_GITHUB_ISSUES:
+        # Build GitHub API query
+        state = "all"
+        if status in ("open", "in_progress", "review"):
+            state = "open"
+        elif status in ("done", "closed"):
+            state = "closed"
+        
+        endpoint = f"/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/issues?state={state}&per_page=50"
+        
+        # Add label filter for priority
+        if priority and priority in PRIORITY_LABELS:
+            endpoint += f"&labels={PRIORITY_LABELS[priority]}"
+        
+        data, error = await github_request("GET", endpoint)
+        
+        if error:
+            return [], error
+        
+        # Filter out pull requests (they also appear in issues API)
+        issues = [i for i in (data or []) if "pull_request" not in i]
+        tasks = [normalize_github_issue(issue) for issue in issues]
+        
+        # Filter by priority if needed (in case label doesn't exist)
+        if priority and not any(PRIORITY_LABELS.get(priority, "") in t.get("labels", []) for t in tasks):
+            # No filtering if priority labels don't exist
+            pass
+        
+        return tasks, None
+    else:
+        # Local fallback
+        data = load_tasks_local()
+        tasks = data.get("tasks", [])
+        if status:
+            tasks = [t for t in tasks if t.get("status") == status]
+        if priority:
+            tasks = [t for t in tasks if t.get("priority") == priority]
+        return tasks, None
+
+
+async def get_task_by_key(key: str) -> tuple[Optional[dict], Optional[str]]:
+    """Get task by key (issue number for GitHub)."""
+    if USE_GITHUB_ISSUES:
+        # Extract issue number from key like "#123" or "123"
+        issue_number = key.lstrip("#").strip()
+        if not issue_number.isdigit():
+            return None, f"Неверный номер issue: {key}"
+        
+        data, error = await github_request("GET", f"/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/issues/{issue_number}")
+        if error:
+            return None, error
+        return normalize_github_issue(data), None
+    else:
+        data = load_tasks_local()
+        for task in data.get("tasks", []):
+            if task.get("key", "").upper() == key.upper():
+                return task, None
+        return None, "Задача не найдена"
+
+
+async def create_task_tracker(title: str, description: str = "", task_type: str = "task", priority: str = "medium") -> tuple[Optional[dict], Optional[str]]:
+    """Create a new task (GitHub Issue)."""
+    if USE_GITHUB_ISSUES:
+        labels = []
+        
+        # Add type label
+        if task_type in TYPE_LABELS:
+            labels.append(TYPE_LABELS[task_type])
+        
+        # Add priority label
+        if priority in PRIORITY_LABELS:
+            labels.append(PRIORITY_LABELS[priority])
+        
+        issue_data = {
+            "title": title,
+            "body": description or title,
+            "labels": labels,
+        }
+        
+        data, error = await github_request("POST", f"/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/issues", issue_data)
+        if error:
+            return None, error
+        return normalize_github_issue(data), None
+    else:
+        # Local fallback
+        data = load_tasks_local()
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        task = {
+            "id": data.get("next_id", 1),
+            "key": f"BOOK-{data.get('next_id', 1)}",
+            "title": title,
+            "description": description or title,
+            "type": task_type,
+            "status": "open",
+            "priority": priority,
+            "assignee": None,
+            "labels": [],
+            "created_at": now,
+            "updated_at": now,
+            "comments": []
+        }
+        data["tasks"].append(task)
+        data["next_id"] = data.get("next_id", 1) + 1
+        save_tasks_local(data)
+        return task, None
+
+
+async def update_task_tracker(key: str, **kwargs) -> tuple[bool, Optional[str]]:
+    """Update task fields (GitHub Issue)."""
+    if USE_GITHUB_ISSUES:
+        issue_number = key.lstrip("#").strip()
+        if not issue_number.isdigit():
+            return False, f"Неверный номер issue: {key}"
+        
+        update_data = {}
+        
+        # Status change = state change in GitHub
+        if "status" in kwargs:
+            if kwargs["status"] in ("done", "closed"):
+                update_data["state"] = "closed"
+            else:
+                update_data["state"] = "open"
+        
+        # Priority change = update labels
+        if "priority" in kwargs:
+            # Get current labels first
+            issue, _ = await get_task_by_key(key)
+            if issue:
+                current_labels = [l for l in issue.get("labels", []) if not l.startswith("priority:")]
+                if kwargs["priority"] in PRIORITY_LABELS:
+                    current_labels.append(PRIORITY_LABELS[kwargs["priority"]])
+                update_data["labels"] = current_labels
+        
+        # Assignee
+        if "assignee" in kwargs:
+            update_data["assignees"] = [kwargs["assignee"]] if kwargs["assignee"] else []
+        
+        if update_data:
+            _, error = await github_request("PATCH", f"/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/issues/{issue_number}", update_data)
+            if error:
+                return False, error
+        
+        return True, None
+    else:
+        # Local fallback
+        data = load_tasks_local()
+        for task in data.get("tasks", []):
+            if task.get("key", "").upper() == key.upper():
+                for k, v in kwargs.items():
+                    if k in task:
+                        task[k] = v
+                task["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                save_tasks_local(data)
+                return True, None
+        return False, "Задача не найдена"
+
+
+async def add_comment_tracker(key: str, text: str) -> tuple[bool, Optional[str]]:
+    """Add comment to task (GitHub Issue)."""
+    if USE_GITHUB_ISSUES:
+        issue_number = key.lstrip("#").strip()
+        if not issue_number.isdigit():
+            return False, f"Неверный номер issue: {key}"
+        
+        _, error = await github_request("POST", f"/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/issues/{issue_number}/comments", {"body": text})
+        return error is None, error
+    else:
+        # Local fallback
+        data = load_tasks_local()
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        for task in data.get("tasks", []):
+            if task.get("key", "").upper() == key.upper():
+                if "comments" not in task:
+                    task["comments"] = []
+                task["comments"].append({"author": "bot", "text": text, "timestamp": now})
+                task["updated_at"] = now
+                save_tasks_local(data)
+                return True, None
+        return False, "Задача не найдена"
+
+
+def format_task_short(task: dict) -> str:
+    """Format task for list view."""
+    priority_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}.get(task.get("priority", ""), "⚪")
+    status_emoji = {"open": "📋", "in_progress": "🔄", "review": "👀", "done": "✅", "closed": "🔒"}.get(task.get("status", ""), "📋")
+    type_emoji = {"bug": "🐛", "feature": "✨", "improvement": "📈", "task": "📝"}.get(task.get("type", ""), "📝")
+    
+    title = task.get("title", task.get("summary", ""))[:50]
+    return f"{status_emoji} *{task.get('key', '')}* {priority_emoji} {type_emoji}\n   {title}"
+
+def format_task_full(task: dict) -> str:
+    """Format task with full details."""
+    priority_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}.get(task.get("priority", ""), "⚪")
+    status_emoji = {"open": "📋", "in_progress": "🔄", "review": "👀", "done": "✅", "closed": "🔒"}.get(task.get("status", ""), "📋")
+    type_emoji = {"bug": "🐛", "feature": "✨", "improvement": "📈", "task": "📝"}.get(task.get("type", ""), "📝")
+    
+    title = task.get("title", task.get("summary", ""))
+    description = task.get("description", "")
+    
+    header = (
+        f"{status_emoji} *{task.get('key', '')}* — {task.get('status', '')}\n"
+        f"{type_emoji} *{title}*\n\n"
+        f"{priority_emoji} Приоритет: {task.get('priority', 'не указан')}\n"
+        f"👤 Исполнитель: {task.get('assignee') or 'не назначен'}\n"
+    )
+    
+    if task.get("labels"):
+        header += f"🏷 Метки: {', '.join(task['labels'])}\n"
+    
+    if description:
+        header += f"\n📄 *Описание:*\n{description[:500]}\n"
+    
+    created = task.get("created_at", "")[:10] if task.get("created_at") else ""
+    if created:
+        header += f"\n📅 Создано: {created}"
+    
+    # Add GitHub link if using GitHub Issues
+    if USE_GITHUB_ISSUES and task.get("html_url"):
+        header += f"\n🔗 [Открыть на GitHub]({task['html_url']})"
+    
+    return header
+
+
+async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show tasks or filter by criteria."""
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    args = context.args or []
+    
+    # Parse filters
+    status = None
+    priority = None
+    
+    for arg in args:
+        arg_lower = arg.lower()
+        if arg_lower in ("open", "in_progress", "review", "done", "closed"):
+            status = arg_lower
+        elif arg_lower in ("critical", "high", "medium", "low"):
+            priority = arg_lower
+    
+    tasks, error = await get_tasks_list(status=status, priority=priority)
+    
+    if error:
+        await update.message.reply_text(f"❌ {error}")
+        return
+    
+    if not tasks:
+        await update.message.reply_text("📭 Задач не найдено")
+        return
+    
+    # Sort by priority
+    priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    tasks.sort(key=lambda t: (priority_order.get(t.get("priority", ""), 4), t.get("created_at", "")))
+    
+    filter_info = []
+    if status: filter_info.append(f"статус={status}")
+    if priority: filter_info.append(f"приоритет={priority}")
+    
+    source = "GitHub Issues" if USE_GITHUB_ISSUES else "локальный"
+    header = f"📋 *Задачи* ({len(tasks)}) — {source}"
+    if filter_info:
+        header += f"\nФильтр: {', '.join(filter_info)}"
+    header += "\n\n"
+    
+    lines = [header]
+    for task in tasks[:15]:
+        lines.append(format_task_short(task))
+        lines.append("")
+    
+    if len(tasks) > 15:
+        lines.append(f"\n_...и ещё {len(tasks) - 15} задач_")
+    
+    lines.append("\n`/task <KEY>` — подробности задачи")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show task details or create new task."""
+    source = "GitHub Issues" if USE_GITHUB_ISSUES else "локальный"
+    
+    if not context.args:
+        await update.message.reply_text(
+            f"📋 *Управление задачами* ({source})\n\n"
+            "`/task <KEY>` — просмотр задачи\n"
+            "`/task_new <название>` — создать задачу\n"
+            "`/tasks` — список всех задач\n"
+            "`/tasks high` — задачи с высоким приоритетом\n"
+            "`/task_status <KEY> <статус>` — изменить статус\n"
+            "`/task_assign <KEY> <исполнитель>` — назначить\n"
+            "`/task_priority <KEY> <приоритет>` — приоритет\n"
+            "`/task_comment <KEY> <текст>` — комментарий\n"
+            "`/task_recommend` — рекомендации AI по приоритетам",
+            parse_mode="Markdown"
+        )
+        return
+    
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    key = context.args[0].upper()
+    task, error = await get_task_by_key(key)
+    
+    if error or not task:
+        await update.message.reply_text(f"❌ Задача `{key}` не найдена", parse_mode="Markdown")
+        return
+    
+    await update.message.reply_text(format_task_full(task), parse_mode="Markdown")
+
+
+async def cmd_task_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create a new task."""
+    source = "GitHub Issues" if USE_GITHUB_ISSUES else "локальный"
+    
+    if not context.args:
+        await update.message.reply_text(
+            f"📝 *Создание задачи* ({source})\n\n"
+            "Использование: `/task_new <название>`\n\n"
+            "Опции (в любом порядке):\n"
+            "• `bug`, `feature`, `task`, `improvement` — тип\n"
+            "• `critical`, `high`, `medium`, `low` — приоритет\n\n"
+            "Примеры:\n"
+            "`/task_new Добавить поиск по книгам`\n"
+            "`/task_new bug high Краш при добавлении`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    # Parse arguments
+    args = context.args
+    task_type = "task"
+    priority = "medium"
+    title_parts = []
+    
+    for arg in args:
+        arg_lower = arg.lower()
+        if arg_lower in ("bug", "feature", "improvement", "task"):
+            task_type = arg_lower
+        elif arg_lower in ("critical", "high", "medium", "low"):
+            priority = arg_lower
+        else:
+            title_parts.append(arg)
+    
+    title = " ".join(title_parts).strip()
+    if not title:
+        await update.message.reply_text("❌ Укажите название задачи")
+        return
+    
+    task, error = await create_task_tracker(title=title, task_type=task_type, priority=priority)
+    
+    if error:
+        await update.message.reply_text(f"❌ {error}")
+        return
+    
+    type_emoji = {"bug": "🐛", "feature": "✨", "improvement": "📈", "task": "📝"}.get(task_type, "📝")
+    priority_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}.get(priority, "⚪")
+    
+    tracker_link = ""
+    if USE_GITHUB_ISSUES and task.get("html_url"):
+        tracker_link = f"\n🔗 [Открыть на GitHub]({task.get('html_url', '')})"
+    
+    await update.message.reply_text(
+        f"✅ Задача создана в {source}!\n\n"
+        f"*{task.get('key', '')}* {type_emoji} {priority_emoji}\n"
+        f"{title}{tracker_link}\n\n"
+        f"`/task {task.get('key', '')}` — подробности",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_task_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Change task status."""
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: `/task_status <KEY> <статус>`\n\n"
+            "Статусы: `open`, `in_progress`, `review`, `done`, `closed`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    key = context.args[0].upper()
+    new_status = context.args[1].lower()
+    
+    if new_status not in ("open", "in_progress", "review", "done", "closed"):
+        await update.message.reply_text("❌ Неверный статус")
+        return
+    
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    task, _ = await get_task_by_key(key)
+    if not task:
+        await update.message.reply_text(f"❌ Задача `{key}` не найдена", parse_mode="Markdown")
+        return
+    
+    old_status = task.get("status", "")
+    success, error = await update_task_tracker(key, status=new_status)
+    
+    if success:
+        status_emoji = {"open": "📋", "in_progress": "🔄", "review": "👀", "done": "✅", "closed": "🔒"}.get(new_status, "📋")
+        await update.message.reply_text(
+            f"{status_emoji} *{key}*: {old_status} → {new_status}",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(f"❌ {error or 'Ошибка обновления'}")
+
+
+async def cmd_task_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Assign task to someone."""
+    if len(context.args) < 2:
+        note = "\n\n⚠️ Укажите GitHub username" if USE_GITHUB_ISSUES else ""
+        await update.message.reply_text(f"Использование: `/task_assign <KEY> <исполнитель>`{note}", parse_mode="Markdown")
+        return
+    
+    key = context.args[0].upper()
+    assignee = context.args[1]
+    
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    task, _ = await get_task_by_key(key)
+    if not task:
+        await update.message.reply_text(f"❌ Задача `{key}` не найдена", parse_mode="Markdown")
+        return
+    
+    success, error = await update_task_tracker(key, assignee=assignee)
+    
+    if success:
+        await update.message.reply_text(f"👤 *{key}* назначена на {assignee}", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ {error or 'Ошибка обновления'}")
+
+
+async def cmd_task_priority(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Change task priority."""
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: `/task_priority <KEY> <приоритет>`\n\n"
+            "Приоритеты: `critical`, `high`, `medium`, `low`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    key = context.args[0].upper()
+    new_priority = context.args[1].lower()
+    
+    if new_priority not in ("critical", "high", "medium", "low"):
+        await update.message.reply_text("❌ Неверный приоритет")
+        return
+    
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    task, _ = await get_task_by_key(key)
+    if not task:
+        await update.message.reply_text(f"❌ Задача `{key}` не найдена", parse_mode="Markdown")
+        return
+    
+    old_priority = task.get("priority", "")
+    success, error = await update_task_tracker(key, priority=new_priority)
+    
+    if success:
+        priority_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}.get(new_priority, "⚪")
+        await update.message.reply_text(
+            f"{priority_emoji} *{key}*: {old_priority} → {new_priority}",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(f"❌ {error or 'Ошибка обновления'}")
+
+
+async def cmd_task_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add comment to task."""
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: `/task_comment <KEY> <текст>`", parse_mode="Markdown")
+        return
+    
+    key = context.args[0].upper()
+    comment_text = " ".join(context.args[1:])
+    
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    task, _ = await get_task_by_key(key)
+    if not task:
+        await update.message.reply_text(f"❌ Задача `{key}` не найдена", parse_mode="Markdown")
+        return
+    
+    user_name = update.effective_user.full_name or f"User {update.effective_user.id}"
+    full_comment = f"[{user_name}] {comment_text}"
+    
+    success, error = await add_comment_tracker(key, full_comment)
+    
+    if success:
+        await update.message.reply_text(f"💬 Комментарий добавлен к *{key}*", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"❌ {error or 'Ошибка добавления комментария'}")
+
+
+async def cmd_task_recommend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get AI recommendations on task priorities."""
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    
+    # Get open tasks
+    open_tasks, _ = await get_tasks_list(status="open")
+    in_progress, _ = await get_tasks_list(status="in_progress")
+    all_open = (open_tasks or []) + (in_progress or [])
+    
+    if not all_open:
+        await update.message.reply_text("✅ Нет открытых задач!")
+        return
+    
+    # Build task list for LLM
+    tasks_text = ""
+    for task in all_open:
+        title = task.get("title", task.get("summary", ""))
+        desc = task.get("description", "")[:100]
+        tasks_text += (
+            f"- {task.get('key', '')}: {title}\n"
+            f"  Тип: {task.get('type', '')}, Приоритет: {task.get('priority', '')}, Статус: {task.get('status', '')}\n"
+            f"  Описание: {desc}...\n\n"
+        )
+    
+    # Get RAG context about project
+    rag_context = ""
+    try:
+        rag_context, _ = kb_retrieve("архитектура проект структура баги проблемы", top_k=3, min_score=0.0)
+    except Exception:
+        rag_context = ""
+    
+    source = "GitHub Issues" if USE_GITHUB_ISSUES else "локального хранилища"
+    system_prompt = f"""Ты опытный тимлид проекта Bookechi. Задачи загружены из {source}.
+Твоя задача — проанализировать список задач и дать рекомендации:
+
+1. Какие задачи делать первыми и почему
+2. Есть ли связанные задачи, которые лучше делать вместе
+3. Какие риски могут быть
+4. Общая оценка бэклога
+
+Учитывай:
+- critical баги блокируют пользователей
+- high влияет на UX
+- Связанные задачи эффективнее делать вместе
+- Bug-и обычно приоритетнее features
+
+Отвечай структурированно, кратко и по делу."""
+
+    prompt = f"""КОНТЕКСТ ПРОЕКТА:
+{rag_context[:2000] if rag_context else "Bookechi — Android-приложение для отслеживания чтения книг на Kotlin/Compose"}
+
+ТЕКУЩИЕ ЗАДАЧИ:
+{tasks_text}
+
+Проанализируй задачи и дай рекомендации по приоритетам."""
+
+    try:
+        user_id = update.effective_user.id
+        model = get_model(user_id)
+        
+        if model == "deepseek":
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ]
+            completion = hf_client.chat.completions.create(
+                model="deepseek-ai/DeepSeek-V3",
+                messages=messages,
+                temperature=0.4,
+                max_tokens=1500,
+            )
+            recommendation = (completion.choices[0].message.content or "").strip()
+        else:
+            messages = [
+                {"role": "system", "text": system_prompt},
+                {"role": "user", "text": prompt}
+            ]
+            result = yandex_sdk.models.completions("yandexgpt").configure(
+                temperature=0.4,
+                max_tokens=1500,
+            ).run(messages)
+            recommendation = ""
+            for alt in result:
+                if hasattr(alt, "text"):
+                    recommendation = (alt.text or "").strip()
+                    break
+        
+        source_label = "GitHub Issues" if USE_GITHUB_ISSUES else "локальный"
+        header = f"🎯 *Рекомендации по задачам* ({len(all_open)} открытых) — {source_label}\n\n"
+        await update.message.reply_text(header + recommendation, parse_mode="Markdown")
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+
+
+# === Smart Issue Creation Mode ===
+user_smart_issue_mode: Dict[int, bool] = {}
+
+
+async def analyze_and_create_issue(user_id: int, message: str) -> tuple[Optional[dict], str]:
+    """
+    Analyze user message and create GitHub Issue with detailed technical description.
+    Returns (created_issue, analysis_text).
+    """
+    
+    # Get RAG context about project for better descriptions
+    rag_context = ""
+    try:
+        rag_context, _ = kb_retrieve("архитектура Bookechi Kotlin Compose структура", top_k=3, min_score=0.0)
+    except Exception:
+        rag_context = ""
+    
+    # Use LLM to analyze and generate full description
+    analysis_prompt = f"""Ты senior Android разработчик проекта Bookechi (Kotlin, Jetpack Compose, MVI).
+
+КОНТЕКСТ ПРОЕКТА:
+{rag_context[:2000] if rag_context else "Bookechi — Android-приложение для отслеживания чтения книг. Стек: Kotlin, Jetpack Compose, Room, Koin, MVI архитектура."}
+
+ЗАПРОС ПОЛЬЗОВАТЕЛЯ:
+"{message}"
+
+Проанализируй запрос и создай ПОЛНОЕ техническое описание задачи.
+
+Ответь СТРОГО в JSON формате:
+{{
+  "is_issue": true,
+  "type": "bug" | "feature" | "improvement",
+  "priority": "critical" | "high" | "medium" | "low",
+  "title": "Краткий заголовок задачи (до 80 символов)",
+  "description": "ПОДРОБНОЕ техническое описание в Markdown формате. Включи:\\n- Описание функционала\\n- Предлагаемый подход к реализации\\n- Затрагиваемые компоненты/файлы\\n- Пример кода на Kotlin (если применимо)\\n- Acceptance criteria",
+  "summary": "Краткое резюме для ответа в чат (1-2 предложения)"
+}}
+
+Если это просто вопрос без задачи:
+{{
+  "is_issue": false,
+  "summary": "Почему это не задача"
+}}
+
+ВАЖНО: description должен быть полноценным техническим описанием с примерами кода!"""
+
+    try:
+        model = get_model(user_id)
+        
+        if model == "deepseek":
+            messages = [
+                {"role": "system", "content": "Ты senior Android разработчик. Создаёшь детальные технические описания задач. Отвечай валидным JSON."},
+                {"role": "user", "content": analysis_prompt}
+            ]
+            completion = hf_client.chat.completions.create(
+                model="deepseek-ai/DeepSeek-V3",
+                messages=messages,
+                temperature=0.3,
+                max_tokens=2000,
+            )
+            response_text = (completion.choices[0].message.content or "").strip()
+        else:
+            messages = [
+                {"role": "system", "text": "Ты senior Android разработчик. Создаёшь детальные технические описания задач. Отвечай валидным JSON."},
+                {"role": "user", "text": analysis_prompt}
+            ]
+            result = yandex_sdk.models.completions("yandexgpt").configure(
+                temperature=0.3,
+                max_tokens=2000,
+            ).run(messages)
+            response_text = ""
+            for alt in result:
+                if hasattr(alt, "text"):
+                    response_text = (alt.text or "").strip()
+                    break
+        
+        # Parse JSON from response
+        json_match = re.search(r'\{[\s\S]*\}', response_text)
+        if not json_match:
+            return None, "Не удалось проанализировать сообщение"
+        
+        analysis = json.loads(json_match.group())
+        
+        if not analysis.get("is_issue", False):
+            return None, analysis.get("summary", "Это вопрос, а не задача")
+        
+        # Create the issue with full technical description
+        title = analysis.get("title", message[:80])
+        description = analysis.get("description", message)
+        task_type = analysis.get("type", "task")
+        priority = analysis.get("priority", "medium")
+        summary = analysis.get("summary", "Задача создана")
+        
+        issue, error = await create_task_tracker(
+            title=title,
+            description=description,
+            task_type=task_type,
+            priority=priority
+        )
+        
+        if error:
+            return None, f"Ошибка создания: {error}"
+        
+        # Add summary to issue for chat response
+        issue["_summary"] = summary
+        return issue, summary
+        
+    except json.JSONDecodeError as e:
+        return None, f"Ошибка парсинга ответа: {e}"
+    except Exception as e:
+        return None, f"Ошибка анализа: {e}"
+
+
+async def cmd_smart_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enable smart issue creation mode."""
+    user_id = update.effective_user.id
+    user_smart_issue_mode[user_id] = True
+    
+    source = "GitHub Issues" if USE_GITHUB_ISSUES else "локальный трекер"
+    await update.message.reply_text(
+        f"🧠 *Умный режим создания задач включён!*\n\n"
+        f"Теперь я буду анализировать твои сообщения и автоматически "
+        f"создавать задачи в {source}, если это похоже на:\n"
+        f"• 🐛 Баг-репорт\n"
+        f"• ✨ Запрос новой фичи\n"
+        f"• 📈 Предложение улучшения\n\n"
+        f"Примеры:\n"
+        f"_\"Нашел баг — приложение крашится при добавлении книги с длинным названием\"_\n"
+        f"_\"Было бы круто добавить тёмную тему\"_\n"
+        f"_\"Нужно оптимизировать загрузку списка книг\"_\n\n"
+        f"`/smart_off` — выключить режим",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_smart_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Disable smart issue creation mode."""
+    user_id = update.effective_user.id
+    user_smart_issue_mode[user_id] = False
+    await update.message.reply_text("🔕 Умный режим создания задач выключен")
+
+
 # === Support Mode Commands ===
 
 async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2429,6 +3280,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary_count = get_summary_count(user_id)
     summary_info = f"\n📦 Загружено суммаризаций из памяти: {summary_count}" if summary_count > 0 else ""
     
+    # Tracker status
+    tracker_status = "🟢 GitHub Issues" if USE_GITHUB_ISSUES else "🟡 Локальный JSON"
+    
     await update.message.reply_text(
         f"👋 Привет! Я бот-ассистент проекта *Bookechi*.{summary_info}\n\n"
         "Просто напиши мне вопрос, и я отвечу.\n\n"
@@ -2436,16 +3290,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — помощь по проекту (RAG + Git)\n"
         "/help <вопрос> — спросить о проекте\n"
         "/review <github\\_url> — ревью коммита/PR\n\n"
+        f"📋 *Трекер задач* ({tracker_status}):\n"
+        "/tasks — список задач\n"
+        "/task <KEY> — подробности задачи\n"
+        "/task\\_new <название> — создать задачу\n"
+        "/smart\\_on — 🧠 умный режим (авто-создание задач)\n"
+        "/task\\_recommend — рекомендации AI\n\n"
         "🎧 *Поддержка пользователей:*\n"
-        "/support — статус режима поддержки\n"
-        "/support\\_on — включить режим поддержки\n"
-        "/support\\_off — выключить\n"
+        "/support\\_on — режим поддержки\n"
         "/ticket\\_new <тема> — создать тикет\n"
-        "/ticket\\_list — мои тикеты\n"
-        "/ticket\\_view <id> — просмотр тикета\n"
-        "/ticket\\_select <id> — выбрать тикет\n"
-        "/ticket\\_close <id> — закрыть тикет\n"
-        "/tickets\\_all — все открытые тикеты\n\n"
+        "/ticket\\_list — мои тикеты\n\n"
         "🔧 *Git интеграция (MCP):*\n"
         "/git\\_status — статус репозитория\n"
         "/git\\_branch — текущая ветка\n"
@@ -3916,6 +4770,105 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(response, parse_mode="Markdown")
             return
     
+    # === SMART ISSUE MODE CHECK ===
+    # If smart issue mode is enabled, analyze message for issue creation
+    if user_smart_issue_mode.get(user_id, False):
+        msg_lower = user_message.lower()
+        
+        # Check if user wants to see tasks list (not create a task)
+        list_keywords = ["покажи", "список", "задач", "tasks", "issues", "тикет", "все задачи", "открытые", "мои задачи"]
+        is_list_request = any(kw in msg_lower for kw in list_keywords) and not any(kw in msg_lower for kw in ["создай", "добавь", "нужно", "хочу", "сделай", "баг", "ошибка", "фича"])
+        
+        if is_list_request:
+            # User wants to see tasks, call cmd_tasks logic
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+            
+            # Parse filters from message
+            status = None
+            priority = None
+            if "открыт" in msg_lower or "open" in msg_lower:
+                status = "open"
+            elif "закрыт" in msg_lower or "closed" in msg_lower or "done" in msg_lower:
+                status = "done"
+            
+            if "critical" in msg_lower or "критич" in msg_lower:
+                priority = "critical"
+            elif "high" in msg_lower or "высок" in msg_lower:
+                priority = "high"
+            
+            tasks, error = await get_tasks_list(status=status, priority=priority)
+            
+            if error:
+                await update.message.reply_text(f"❌ {error}")
+                return
+            
+            if not tasks:
+                await update.message.reply_text("📭 Задач не найдено\n\n_Создай задачу, описав баг или фичу_", parse_mode="Markdown")
+                return
+            
+            # Sort by priority
+            priority_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+            tasks.sort(key=lambda t: (priority_order.get(t.get("priority", ""), 4), t.get("created_at", "")))
+            
+            source = "GitHub Issues" if USE_GITHUB_ISSUES else "локальный"
+            lines = [f"📋 *Задачи* ({len(tasks)}) — {source}\n"]
+            
+            for task in tasks[:20]:
+                lines.append(format_task_short(task))
+                lines.append("")
+            
+            if len(tasks) > 20:
+                lines.append(f"_...и ещё {len(tasks) - 20} задач_")
+            
+            lines.append("\n`/task <KEY>` — подробности")
+            lines.append("─────────────────────")
+            lines.append("🧠 _Smart Issue Mode_ | `/smart_off`")
+            
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+            return
+        
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        
+        issue, reason = await analyze_and_create_issue(user_id, user_message)
+        
+        if issue:
+            # Issue was created!
+            type_emoji = {"bug": "🐛", "feature": "✨", "improvement": "📈", "task": "📝"}.get(issue.get("type", ""), "📝")
+            type_name = {"bug": "Баг", "feature": "Фича", "improvement": "Улучшение", "task": "Задача"}.get(issue.get("type", ""), "Задача")
+            priority_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}.get(issue.get("priority", ""), "⚪")
+            priority_name = {"critical": "Критический", "high": "Высокий", "medium": "Средний", "low": "Низкий"}.get(issue.get("priority", ""), "")
+            
+            source = "GitHub Issues" if USE_GITHUB_ISSUES else "локальный трекер"
+            summary = issue.get("_summary", reason)
+            
+            # Build response
+            response_lines = [
+                f"✅ *Задача создана!*",
+                f"",
+                f"📌 *{issue.get('key', '')}*: {issue.get('title', '')}",
+                f"",
+                f"{type_emoji} Тип: {type_name}",
+                f"{priority_emoji} Приоритет: {priority_name}",
+                f"📍 Трекер: {source}",
+            ]
+            
+            if issue.get("html_url"):
+                response_lines.append(f"")
+                response_lines.append(f"🔗 [Открыть на GitHub]({issue['html_url']})")
+            
+            response_lines.append(f"")
+            response_lines.append(f"💬 _{summary}_")
+            response_lines.append(f"")
+            response_lines.append(f"─────────────────────")
+            response_lines.append(f"🧠 _Smart Issue Mode_ | `/smart_off`")
+            
+            await update.message.reply_text("\n".join(response_lines), parse_mode="Markdown")
+            return
+        else:
+            # Not an issue, continue to normal chat but mention it
+            # Add a note that this wasn't detected as an issue
+            pass  # Continue to normal message handling
+    
     # Показываем, что бот "печатает"
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     
@@ -4242,6 +5195,18 @@ def main():
     app.add_handler(CommandHandler("ticket_select", cmd_ticket_select))
     app.add_handler(CommandHandler("ticket_close", cmd_ticket_close))
     app.add_handler(CommandHandler("tickets_all", cmd_tickets_all))
+    # Task Tracker команды
+    app.add_handler(CommandHandler("tasks", cmd_tasks))
+    app.add_handler(CommandHandler("task", cmd_task))
+    app.add_handler(CommandHandler("task_new", cmd_task_new))
+    app.add_handler(CommandHandler("task_status", cmd_task_status))
+    app.add_handler(CommandHandler("task_assign", cmd_task_assign))
+    app.add_handler(CommandHandler("task_priority", cmd_task_priority))
+    app.add_handler(CommandHandler("task_comment", cmd_task_comment))
+    app.add_handler(CommandHandler("task_recommend", cmd_task_recommend))
+    # Smart Issue Mode
+    app.add_handler(CommandHandler("smart_on", cmd_smart_on))
+    app.add_handler(CommandHandler("smart_off", cmd_smart_off))
     # Git команды
     app.add_handler(CommandHandler("git_status", cmd_git_status))
     app.add_handler(CommandHandler("git_branch", cmd_git_branch))
